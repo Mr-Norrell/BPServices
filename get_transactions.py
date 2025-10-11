@@ -9,6 +9,7 @@ import uuid
 import base64
 from datetime import datetime, timedelta, timezone
 import html
+import json
 # import shlex # For debugging curl command construction
 
 def generate_soap_headers_values():
@@ -92,10 +93,115 @@ def call_curl(soap_request_data):
         print("Error: curl command not found. Please ensure curl is installed and in your PATH.")
         return None
 
+def call_rest_curl(url, username, password, terminal_id, from_date, to_date, extra_headers=None):
+    """Calls the REST endpoint via curl and returns the output (JSON string)."""
+    if not url:
+        print("Error: REST URL is required when using REST ApiType.")
+        return None
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    if isinstance(extra_headers, dict):
+        headers.update(extra_headers)
+
+    body = {
+        "username": username,
+        "password": password,
+        "terminalId": terminal_id,
+        "fromDate": from_date,
+        "toDate": to_date
+    }
+
+    curl_command = [
+        'curl', '-X', 'POST', url,
+        '-H', f"Content-Type: {headers['Content-Type']}",
+        '-H', f"Accept: {headers['Accept']}",
+        '-u', f"{username}:{password}",
+        '-d', json.dumps(body)
+    ]
+
+    print("Executing REST curl command...")
+    try:
+        process = subprocess.run(curl_command, capture_output=True, text=True, check=True, encoding='utf-8')
+        print("REST curl command executed successfully.")
+        return process.stdout
+    except subprocess.CalledProcessError as e:
+        print(f"Error during REST curl execution: {e}")
+        print(f"Stderr: {e.stderr}")
+        print(f"Stdout: {e.stdout}")
+        return None
+    except FileNotFoundError:
+        print("Error: curl command not found. Please ensure curl is installed and in your PATH.")
+        return None
+
 def parse_xml_to_csv(xml_output, csv_filename):
     """Parses the SOAP XML response and writes data to a CSV file."""
     if not xml_output:
         print("No XML output to parse.")
+        return False
+
+def parse_json_to_csv(json_output, csv_filename):
+    """Parses a JSON response and writes transaction data to a CSV file."""
+    if not json_output:
+        print("No JSON output to parse.")
+        return False
+
+    try:
+        parsed = json.loads(json_output)
+
+        if isinstance(parsed, dict):
+            success = parsed.get('success')
+            response_code = parsed.get('responseCode')
+            response_message = parsed.get('responseMessage')
+            if success is not None:
+                print(f"Success: {success}")
+            if response_code is not None or response_message is not None:
+                print(f"Status: Code='{response_code}', Message='{response_message}'")
+
+            records = parsed.get('transactionInfoList')
+            if isinstance(records, list) and records:
+                header = list(records[0].keys())
+                with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
+                    writer = csv.DictWriter(csvfile, fieldnames=header)
+                    writer.writeheader()
+                    for item in records:
+                        row = {h: (item.get(h, '') if isinstance(item, dict) else '') for h in header}
+                        writer.writerow(row)
+                print(f"Successfully converted JSON data to {csv_filename}")
+                return True
+
+            # Fallback: write the dict as a single row
+            header = list(parsed.keys())
+            with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=header)
+                writer.writeheader()
+                writer.writerow({h: parsed.get(h, '') for h in header})
+            print(f"Wrote single-row JSON dictionary to {csv_filename}")
+            return True
+
+        if isinstance(parsed, list) and parsed:
+            header = list(parsed[0].keys()) if isinstance(parsed[0], dict) else ["value"]
+            with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=header)
+                writer.writeheader()
+                for item in parsed:
+                    if isinstance(item, dict):
+                        writer.writerow({h: item.get(h, '') for h in header})
+                    else:
+                        writer.writerow({"value": item})
+            print(f"Successfully converted JSON array to {csv_filename}")
+            return True
+
+        print("JSON did not contain recognizable transaction data.")
+        return False
+    except json.JSONDecodeError as e:
+        print(f"Error parsing JSON: {e}")
+        print("Problematic JSON (first 1000 chars):", json_output[:1000])
+        return False
+    except Exception as e:
+        print(f"An unexpected error occurred during JSON parsing or CSV writing: {e}")
         return False
 
     try:
@@ -200,12 +306,12 @@ def main():
     parser.add_argument(
         "-U", "--Username",
         default="Sarmaye1402",
-        help="Username for authentication (default: USERNAME)"
+        help="Username for authentication (default: Sarmaye1402)"
     )
     parser.add_argument(
         "-P", "--Password",
         default="18316913",
-        help="Password for authentication (default: PASSWORD)"
+        help="Password for authentication (default: 18316913)"
     )
     parser.add_argument("-T", "--TerminalId", required=True, help="Terminal ID")
     parser.add_argument(
@@ -214,6 +320,8 @@ def main():
         help="From Date in YYYYMMDD format (defaults to ToDate if not provided)"
     )
     parser.add_argument("-O", "--ToDate", required=True, help="To Date in YYYYMMDD format")
+    parser.add_argument("--ApiType", choices=["soap", "rest"], default="soap", help="Choose API type: soap or rest (default: soap)")
+    parser.add_argument("--RestUrl", default="https://api.bpm.bankmellat.ir/transaction/getTransactionByDate", help="REST endpoint URL (default: https://api.bpm.bankmellat.ir/transaction/getTransactionByDate)")
 
     args = parser.parse_args()
 
@@ -235,31 +343,42 @@ def main():
         print("Error: FromDate must be in YYYYMMDD format.")
         return
 
-    if args.Username == "USERNAME" or args.Password == "PASSWORD":
-        print("Warning: Using default Username or Password. Please provide actual credentials for real use.")
 
-    header_values = generate_soap_headers_values()
+    csv_filename = f"{args.TerminalId}-{args.FromDate}-{args.ToDate}.csv"
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    csv_filepath = os.path.join(script_dir, csv_filename)
 
-    soap_request = build_soap_request(
-        args.Username,
-        args.Password,
-        args.TerminalId,
-        args.FromDate,
-        args.ToDate,
-        header_values
-    )
-    # print("Generated SOAP Request:\n", soap_request) # For debugging
+    if args.ApiType == "soap":
+        header_values = generate_soap_headers_values()
 
-    xml_response = call_curl(soap_request)
+        soap_request = build_soap_request(
+            args.Username,
+            args.Password,
+            args.TerminalId,
+            args.FromDate,
+            args.ToDate,
+            header_values
+        )
+        # print("Generated SOAP Request:\n", soap_request) # For debugging
 
-    if xml_response:
-        csv_filename = f"{args.TerminalId}-{args.FromDate}-{args.ToDate}.csv"
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        csv_filepath = os.path.join(script_dir, csv_filename)
-
-        parse_xml_to_csv(xml_response, csv_filepath)
+        xml_response = call_curl(soap_request)
+        if xml_response:
+            parse_xml_to_csv(xml_response, csv_filepath)
+        else:
+            print("Failed to get a response from the SOAP API.")
     else:
-        print("Failed to get a response from the API.")
+        json_response = call_rest_curl(
+            args.RestUrl,
+            args.Username,
+            args.Password,
+            args.TerminalId,
+            args.FromDate,
+            args.ToDate
+        )
+        if json_response:
+            parse_json_to_csv(json_response, csv_filepath)
+        else:
+            print("Failed to get a response from the REST API.")
 
 if __name__ == "__main__":
     main()
