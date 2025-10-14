@@ -115,18 +115,53 @@ def call_rest_curl(url, username, password, terminal_id, from_date, to_date, ext
     }
 
     curl_command = [
-        'curl', '-X', 'POST', url,
+        'curl',
+        '--silent',            # do not print progress meter
+        '--show-error',        # still show errors
+        '--location',          # follow redirects
+        '-X', 'POST', url,
         '-H', f"Content-Type: {headers['Content-Type']}",
         '-H', f"Accept: {headers['Accept']}",
         '-u', f"{username}:{password}",
-        '-d', json.dumps(body)
+        '-d', json.dumps(body),
+        '-w', '\nHTTP_STATUS:%{http_code}\nCONTENT_TYPE:%{content_type}\n'  # append status meta
     ]
 
     print("Executing REST curl command...")
     try:
         process = subprocess.run(curl_command, capture_output=True, text=True, check=True, encoding='utf-8')
+        stdout_text = process.stdout or ""
+        stderr_text = process.stderr or ""
+
+        # Extract and log status meta if present (written to stdout due to -w)
+        http_status = None
+        content_type = None
+        if "HTTP_STATUS:" in stdout_text:
+            parts = stdout_text.split("\n")
+            body_lines = []
+            for line in parts:
+                if line.startswith("HTTP_STATUS:"):
+                    try:
+                        http_status = int(line.split(":", 1)[1].strip())
+                    except Exception:
+                        http_status = None
+                    continue
+                if line.startswith("CONTENT_TYPE:"):
+                    content_type = line.split(":", 1)[1].strip()
+                    continue
+                body_lines.append(line)
+            stdout_text = "\n".join(body_lines).rstrip("\n")
+
+        if http_status is not None:
+            print(f"REST status: {http_status} ({content_type or 'unknown content-type'})")
         print("REST curl command executed successfully.")
-        return process.stdout
+
+        # If the server wrote body to stderr for some reason and stdout is empty, return stderr
+        if not stdout_text.strip() and stderr_text.strip():
+            print("Note: Empty stdout; using stderr as response body.")
+            return stderr_text
+
+        return stdout_text
     except subprocess.CalledProcessError as e:
         print(f"Error during REST curl execution: {e}")
         print(f"Stderr: {e.stderr}")
