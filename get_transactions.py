@@ -340,12 +340,12 @@ def main():
     parser = argparse.ArgumentParser(description="Call Bank Mellat Transaction API and convert output to CSV.")
     parser.add_argument(
         "-U", "--Username",
-        default="Sarmaye1402",
+        default="RSarmaye1402",
         help="Username for authentication (default: Sarmaye1402)"
     )
     parser.add_argument(
         "-P", "--Password",
-        default="18316913",
+        default="12021453",
         help="Password for authentication (default: 18316913)"
     )
     parser.add_argument("-T", "--TerminalId", required=True, help="Terminal ID")
@@ -355,8 +355,8 @@ def main():
         help="From Date in YYYYMMDD format (defaults to ToDate if not provided)"
     )
     parser.add_argument("-O", "--ToDate", required=True, help="To Date in YYYYMMDD format")
-    parser.add_argument("--ApiType", choices=["soap", "rest"], default="soap", help="Choose API type: soap or rest (default: soap)")
-    parser.add_argument("--RestUrl", default="https://api.bpm.bankmellat.ir/transaction/getTransactionByDate", help="REST endpoint URL (default: https://api.bpm.bankmellat.ir/transaction/getTransactionByDate)")
+    parser.add_argument("--ApiType", choices=["soap", "rest"], default="rest", help="Choose API type: soap or rest (default: rest)")
+    parser.add_argument("--RestUrl", default="https://bos.behpardakht.com/bhrws/transactionInfo/getTransactionByDate", help="REST endpoint URL (default: https://bos.behpardakht.com/bhrws/transactionInfo/getTransactionByDate)")
 
     args = parser.parse_args()
 
