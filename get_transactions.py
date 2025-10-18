@@ -10,6 +10,7 @@ import base64
 from datetime import datetime, timedelta, timezone
 import html
 import json
+import itertools
 # import shlex # For debugging curl command construction
 
 def generate_soap_headers_values():
@@ -176,6 +177,86 @@ def parse_xml_to_csv(xml_output, csv_filename):
     if not xml_output:
         print("No XML output to parse.")
         return False
+
+def parse_date(date_str):
+    """Parse a date string in YYYYMMDD format to a datetime object."""
+    try:
+        return datetime.strptime(date_str, '%Y%m%d')
+    except ValueError as e:
+        print(f"Error parsing date {date_str}: {e}")
+        return None
+
+def format_date(date_obj):
+    """Format a datetime object to YYYYMMDD string."""
+    return date_obj.strftime('%Y%m%d')
+
+def split_date_range(from_date_str, to_date_str, max_days=7):
+    """Split a date range into chunks of max_days or less."""
+    from_date = parse_date(from_date_str)
+    to_date = parse_date(to_date_str)
+    
+    if not from_date or not to_date:
+        return []
+    
+    if from_date > to_date:
+        print(f"Error: FromDate {from_date_str} is after ToDate {to_date_str}")
+        return []
+    
+    # Calculate total days in the range
+    total_days = (to_date - from_date).days + 1
+    
+    if total_days <= max_days:
+        # If within limit, return the original range
+        return [(from_date_str, to_date_str)]
+    
+    # Split into chunks
+    chunks = []
+    current_from = from_date
+    
+    while current_from <= to_date:
+        # Calculate the end of this chunk (either max_days away or to_date, whichever is sooner)
+        current_to = min(current_from + timedelta(days=max_days-1), to_date)
+        chunks.append((format_date(current_from), format_date(current_to)))
+        current_from = current_to + timedelta(days=1)
+    
+    return chunks
+
+def merge_json_responses(json_outputs):
+    """Merges multiple JSON responses into a single data structure."""
+    if not json_outputs:
+        return None
+    
+    merged_data = None
+    transaction_lists = []
+    
+    for json_output in json_outputs:
+        if not json_output:
+            continue
+            
+        try:
+            parsed = json.loads(json_output)
+            
+            # Initialize merged_data with the first response structure
+            if merged_data is None:
+                merged_data = parsed.copy()
+                if 'transactionInfoList' in merged_data:
+                    # Store the transaction list separately and create an empty list in merged_data
+                    transaction_lists.append(merged_data.get('transactionInfoList', []))
+                    merged_data['transactionInfoList'] = []
+            
+            # For subsequent responses, just collect their transaction lists
+            elif isinstance(parsed, dict) and 'transactionInfoList' in parsed:
+                transaction_lists.append(parsed.get('transactionInfoList', []))
+                
+        except json.JSONDecodeError as e:
+            print(f"Error parsing one of the JSON responses: {e}")
+            continue
+    
+    # Merge all transaction lists into one
+    if merged_data and 'transactionInfoList' in merged_data:
+        merged_data['transactionInfoList'] = list(itertools.chain.from_iterable(transaction_lists))
+    
+    return merged_data
 
 def parse_json_to_csv(json_output, csv_filename):
     """Parses a JSON response and writes transaction data to a CSV file."""
@@ -402,18 +483,52 @@ def main():
         else:
             print("Failed to get a response from the SOAP API.")
     else:
-        json_response = call_rest_curl(
-            args.RestUrl,
-            args.Username,
-            args.Password,
-            args.TerminalId,
-            args.FromDate,
-            args.ToDate
-        )
-        if json_response:
-            parse_json_to_csv(json_response, csv_filepath)
+        # For REST API, check if we need to split the date range (max 7 days)
+        date_chunks = split_date_range(args.FromDate, args.ToDate, max_days=7)
+        
+        if not date_chunks:
+            print("Failed to process date range. Please check your date format.")
+            return
+            
+        if len(date_chunks) > 1:
+            print(f"Date range exceeds 7 days. Breaking into {len(date_chunks)} chunks:")
+            for i, (chunk_from, chunk_to) in enumerate(date_chunks):
+                print(f"  Chunk {i+1}: {chunk_from} to {chunk_to}")
+                
+        # Collect responses from all chunks
+        json_responses = []
+        
+        for chunk_from, chunk_to in date_chunks:
+            print(f"Requesting data for period: {chunk_from} to {chunk_to}")
+            json_response = call_rest_curl(
+                args.RestUrl,
+                args.Username,
+                args.Password,
+                args.TerminalId,
+                chunk_from,
+                chunk_to
+            )
+            if json_response:
+                json_responses.append(json_response)
+            else:
+                print(f"Failed to get a response from the REST API for period {chunk_from} to {chunk_to}")
+        
+        if json_responses:
+            # If we have multiple responses, merge them
+            if len(json_responses) > 1:
+                print(f"Merging {len(json_responses)} responses...")
+                merged_data = merge_json_responses(json_responses)
+                if merged_data:
+                    # Convert merged data back to JSON string
+                    merged_json = json.dumps(merged_data)
+                    parse_json_to_csv(merged_json, csv_filepath)
+                else:
+                    print("Failed to merge JSON responses.")
+            else:
+                # Just one response, process it directly
+                parse_json_to_csv(json_responses[0], csv_filepath)
         else:
-            print("Failed to get a response from the REST API.")
+            print("Failed to get any valid responses from the REST API.")
 
 if __name__ == "__main__":
     main()
