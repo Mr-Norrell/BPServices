@@ -11,6 +11,8 @@ from datetime import datetime, timedelta, timezone
 import html
 import json
 import itertools
+import time
+import random
 # import shlex # For debugging curl command construction
 
 def generate_soap_headers_values():
@@ -155,6 +157,8 @@ def call_rest_curl(url, username, password, terminal_id, from_date, to_date, ext
 
         if http_status is not None:
             print(f"REST status: {http_status} ({content_type or 'unknown content-type'})")
+            # Add HTTP status to the response for retry detection
+            stdout_text += f"\nHTTP_STATUS:{http_status}"
         print("REST curl command executed successfully.")
 
         # If the server wrote body to stderr for some reason and stdout is empty, return stderr
@@ -189,6 +193,49 @@ def parse_date(date_str):
 def format_date(date_obj):
     """Format a datetime object to YYYYMMDD string."""
     return date_obj.strftime('%Y%m%d')
+
+def retry_with_backoff(func, *args, max_retries=3, initial_delay=2, backoff_factor=2, **kwargs):
+    """
+    Execute a function with retry logic and exponential backoff.
+    
+    Args:
+        func: The function to execute
+        *args: Positional arguments to pass to the function
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds
+        backoff_factor: Factor by which the delay increases after each failure
+        **kwargs: Keyword arguments to pass to the function
+        
+    Returns:
+        The result of the function call, or None if all retries failed
+    """
+    delay = initial_delay
+    result = None
+    
+    for attempt in range(max_retries + 1):
+        if attempt > 0:
+            # Add some jitter to the delay to prevent synchronized retries
+            jitter = random.uniform(0.8, 1.2)
+            actual_delay = delay * jitter
+            
+            print(f"Rate limit exceeded. Retrying in {actual_delay:.1f} seconds (attempt {attempt}/{max_retries})...")
+            time.sleep(actual_delay)
+            
+            # Increase delay for next attempt
+            delay *= backoff_factor
+        
+        result = func(*args, **kwargs)
+        
+        # Check if we got a rate limit response (HTTP 429)
+        if isinstance(result, str) and "HTTP_STATUS:429" in result:
+            continue  # Retry
+        
+        # If we got here, the call was successful or failed for a reason other than rate limiting
+        return result
+    
+    # If we exhausted all retries
+    print(f"Failed after {max_retries} retries.")
+    return result
 
 def split_date_range(from_date_str, to_date_str, max_days=7):
     """Split a date range into chunks of max_days or less."""
@@ -438,6 +485,7 @@ def main():
     parser.add_argument("-O", "--ToDate", required=True, help="To Date in YYYYMMDD format")
     parser.add_argument("--ApiType", choices=["soap", "rest"], default="rest", help="Choose API type: soap or rest (default: rest)")
     parser.add_argument("--RestUrl", default="https://bos.behpardakht.com/bhrws/transactionInfo/getTransactionByDate", help="REST endpoint URL (default: https://bos.behpardakht.com/bhrws/transactionInfo/getTransactionByDate)")
+    parser.add_argument("--Delay", type=float, default=1.5, help="Delay in seconds between API requests to avoid rate limiting (default: 1.5)")
 
     args = parser.parse_args()
 
@@ -498,20 +546,39 @@ def main():
         # Collect responses from all chunks
         json_responses = []
         
-        for chunk_from, chunk_to in date_chunks:
+        # Use the delay specified in command line arguments
+        delay_between_requests = args.Delay
+        
+        for i, (chunk_from, chunk_to) in enumerate(date_chunks):
+            # Add delay between requests to avoid rate limiting, except for the first request
+            if i > 0:
+                delay_with_jitter = delay_between_requests * random.uniform(0.9, 1.1)
+                print(f"Waiting {delay_with_jitter:.1f} seconds before next request...")
+                time.sleep(delay_with_jitter)
+            
             print(f"Requesting data for period: {chunk_from} to {chunk_to}")
-            json_response = call_rest_curl(
+            
+            # Use retry mechanism for the API call
+            json_response = retry_with_backoff(
+                call_rest_curl,
                 args.RestUrl,
                 args.Username,
                 args.Password,
                 args.TerminalId,
                 chunk_from,
-                chunk_to
+                chunk_to,
+                max_retries=3,
+                initial_delay=3,
+                backoff_factor=2
             )
-            if json_response:
+            
+            if json_response and "HTTP_STATUS:429" not in json_response:
+                # Remove any HTTP status information we added for retry detection
+                if "\nHTTP_STATUS:" in json_response:
+                    json_response = json_response.split("\nHTTP_STATUS:")[0]
                 json_responses.append(json_response)
             else:
-                print(f"Failed to get a response from the REST API for period {chunk_from} to {chunk_to}")
+                print(f"Failed to get a valid response from the REST API for period {chunk_from} to {chunk_to}")
         
         if json_responses:
             # If we have multiple responses, merge them
