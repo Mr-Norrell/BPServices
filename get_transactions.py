@@ -13,6 +13,8 @@ import json
 import itertools
 import time
 import random
+import tempfile
+import shutil
 # import shlex # For debugging curl command construction
 
 def generate_soap_headers_values():
@@ -97,10 +99,17 @@ def call_curl(soap_request_data):
         return None
 
 def call_rest_curl(url, username, password, terminal_id, from_date, to_date, last_id=None, extra_headers=None):
-    """Calls the REST endpoint via curl and returns the output (JSON string)."""
+    """
+    Calls the REST endpoint via curl and returns the output (JSON string).
+    
+    Returns:
+        str: The response body on success
+        str: Error message with "ERROR:" prefix for permanent errors
+        None: For transient errors that should be retried
+    """
     if not url:
         print("Error: REST URL is required when using REST ApiType.")
-        return None
+        return "ERROR: Missing REST URL"
 
     headers = {
         "Content-Type": "application/json",
@@ -127,6 +136,8 @@ def call_rest_curl(url, username, password, terminal_id, from_date, to_date, las
         '--silent',            # do not print progress meter
         '--show-error',        # still show errors
         '--location',          # follow redirects
+        '--connect-timeout', '30',  # timeout for connection phase
+        '--max-time', '120',        # max time for the whole operation
         '-X', 'POST', url,
         '-H', f"Content-Type: {headers['Content-Type']}",
         '-H', f"Accept: {headers['Accept']}",
@@ -137,7 +148,7 @@ def call_rest_curl(url, username, password, terminal_id, from_date, to_date, las
 
     print("Executing REST curl command...")
     try:
-        process = subprocess.run(curl_command, capture_output=True, text=True, check=True, encoding='utf-8')
+        process = subprocess.run(curl_command, capture_output=True, text=True, check=False, encoding='utf-8')
         stdout_text = process.stdout or ""
         stderr_text = process.stderr or ""
 
@@ -160,25 +171,115 @@ def call_rest_curl(url, username, password, terminal_id, from_date, to_date, las
                 body_lines.append(line)
             stdout_text = "\n".join(body_lines).rstrip("\n")
 
+        # Check for curl exit code first
+        if process.returncode != 0:
+            # Categorize the error based on curl exit codes and stderr
+            curl_exit_code = process.returncode
+            
+            # Common curl exit codes for transient errors
+            transient_curl_errors = {
+                7: "Failed to connect",
+                28: "Operation timeout",
+                35: "SSL connect error",
+                52: "Empty reply from server",
+                56: "Failure in receiving network data",
+                60: "Peer certificate cannot be authenticated"
+            }
+            
+            # Permanent errors that shouldn't be retried
+            permanent_curl_errors = {
+                1: "Unsupported protocol",
+                3: "URL malformed",
+                5: "Couldn't resolve proxy",
+                6: "Couldn't resolve host",
+                22: "HTTP page not retrieved (404, etc)",
+                51: "SSL peer certificate or SSH remote key was not OK",
+                67: "Login denied"
+            }
+            
+            if curl_exit_code in transient_curl_errors:
+                error_desc = transient_curl_errors[curl_exit_code]
+                print(f"Transient error: curl({curl_exit_code}) - {error_desc}")
+                # Return None for transient errors to trigger retry
+                return None
+            elif curl_exit_code in permanent_curl_errors:
+                error_desc = permanent_curl_errors[curl_exit_code]
+                print(f"Permanent error: curl({curl_exit_code}) - {error_desc}")
+                return f"ERROR: curl({curl_exit_code}) - {error_desc}"
+            else:
+                # For unknown exit codes, check stderr for common transient error patterns
+                transient_patterns = [
+                    "unexpected eof while reading",
+                    "connection reset by peer",
+                    "timeout",
+                    "connection refused",
+                    "network unreachable",
+                    "ssl handshake failure"
+                ]
+                
+                if stderr_text and any(pattern in stderr_text.lower() for pattern in transient_patterns):
+                    print(f"Transient network error: {stderr_text.strip()}")
+                    return None
+                else:
+                    print(f"Unknown curl error ({curl_exit_code}): {stderr_text.strip()}")
+                    # For unknown errors, include the stderr in the response to help with debugging
+                    return f"ERROR: curl({curl_exit_code}) - {stderr_text.strip()}"
+        
+        # Process successful responses
         if http_status is not None:
             print(f"REST status: {http_status} ({content_type or 'unknown content-type'})")
-            # Add HTTP status to the response for retry detection
-            stdout_text += f"\nHTTP_STATUS:{http_status}"
-        print("REST curl command executed successfully.")
+            
+            # Handle HTTP status codes
+            if http_status >= 200 and http_status < 300:
+                # Success
+                print("REST curl command executed successfully.")
+                # Add HTTP status to the response for retry detection
+                stdout_text += f"\nHTTP_STATUS:{http_status}"
+            elif http_status == 429:
+                # Rate limiting - should be retried
+                print("Rate limit exceeded.")
+                stdout_text += f"\nHTTP_STATUS:{http_status}"
+            elif http_status >= 500:
+                # Server errors - should be retried
+                print(f"Server error: HTTP {http_status}")
+                return None
+            elif http_status >= 400 and http_status < 500:
+                # Client errors - should not be retried
+                print(f"Client error: HTTP {http_status}")
+                return f"ERROR: HTTP {http_status} - Client error"
+            else:
+                # Other status codes
+                stdout_text += f"\nHTTP_STATUS:{http_status}"
+        else:
+            print("REST curl command completed but no HTTP status was returned.")
 
         # If the server wrote body to stderr for some reason and stdout is empty, return stderr
         if not stdout_text.strip() and stderr_text.strip():
             print("Note: Empty stdout; using stderr as response body.")
             return stderr_text
 
+        # Check for empty or invalid JSON response
+        if not stdout_text.strip():
+            print("Warning: Empty response body.")
+            return None
+            
+        # Try to parse as JSON to validate the response
+        try:
+            json.loads(stdout_text)
+        except json.JSONDecodeError:
+            print("Warning: Response is not valid JSON. This might indicate a partial or corrupted response.")
+            # If response is not valid JSON, treat as transient error
+            if len(stdout_text) < 100:  # If it's a short response, print it for debugging
+                print(f"Invalid JSON response: {stdout_text}")
+            return None
+
         return stdout_text
-    except subprocess.CalledProcessError as e:
-        print(f"Error during REST curl execution: {e}")
-        print(f"Stderr: {e.stderr}")
-        print(f"Stdout: {e.stdout}")
-        return None
+        
     except FileNotFoundError:
         print("Error: curl command not found. Please ensure curl is installed and in your PATH.")
+        return "ERROR: curl command not found"
+    except Exception as e:
+        print(f"Unexpected error during REST curl execution: {str(e)}")
         return None
 
 def parse_xml_to_csv(xml_output, csv_filename):
@@ -199,7 +300,7 @@ def format_date(date_obj):
     """Format a datetime object to YYYYMMDD string."""
     return date_obj.strftime('%Y%m%d')
 
-def retry_with_backoff(func, *args, max_retries=3, initial_delay=2, backoff_factor=2, **kwargs):
+def retry_with_backoff(func, *args, max_retries=3, initial_delay=2, backoff_factor=2, error_type="Unknown error", **kwargs):
     """
     Execute a function with retry logic and exponential backoff.
     
@@ -209,6 +310,7 @@ def retry_with_backoff(func, *args, max_retries=3, initial_delay=2, backoff_fact
         max_retries: Maximum number of retry attempts
         initial_delay: Initial delay in seconds
         backoff_factor: Factor by which the delay increases after each failure
+        error_type: Description of the error being retried (for better logging)
         **kwargs: Keyword arguments to pass to the function
         
     Returns:
@@ -223,23 +325,49 @@ def retry_with_backoff(func, *args, max_retries=3, initial_delay=2, backoff_fact
             jitter = random.uniform(0.8, 1.2)
             actual_delay = delay * jitter
             
-            print(f"Rate limit exceeded. Retrying in {actual_delay:.1f} seconds (attempt {attempt}/{max_retries})...")
+            print(f"{error_type}. Retrying in {actual_delay:.1f} seconds (attempt {attempt}/{max_retries})...")
             time.sleep(actual_delay)
             
             # Increase delay for next attempt
             delay *= backoff_factor
         
-        result = func(*args, **kwargs)
-        
-        # Check if we got a rate limit response (HTTP 429)
-        if isinstance(result, str) and "HTTP_STATUS:429" in result:
-            continue  # Retry
-        
-        # If we got here, the call was successful or failed for a reason other than rate limiting
-        return result
+        try:
+            result = func(*args, **kwargs)
+            
+            # Check if we got a rate limit response (HTTP 429)
+            if isinstance(result, str) and "HTTP_STATUS:429" in result:
+                error_type = "Rate limit exceeded"
+                continue  # Retry
+                
+            # Check for empty response that might indicate a transient error
+            if result is None or (isinstance(result, str) and not result.strip()):
+                error_type = "Empty response received"
+                continue  # Retry
+                
+            # Check for specific error strings that indicate transient issues
+            transient_errors = [
+                "unexpected eof while reading",
+                "connection reset by peer",
+                "timeout",
+                "connection refused",
+                "network unreachable",
+                "ssl handshake failure"
+            ]
+            
+            if isinstance(result, str) and any(error in result.lower() for error in transient_errors):
+                error_type = "Transient network error"
+                continue  # Retry
+            
+            # If we got here, the call was successful or failed for a reason other than the ones we're handling
+            return result
+            
+        except Exception as e:
+            error_type = f"Exception: {str(e)}"
+            result = None
+            continue  # Retry after exception
     
     # If we exhausted all retries
-    print(f"Failed after {max_retries} retries.")
+    print(f"Failed after {max_retries} retries due to: {error_type}")
     return result
 
 def split_date_range(from_date_str, to_date_str, max_days=7):
@@ -309,6 +437,133 @@ def merge_json_responses(json_outputs):
         merged_data['transactionInfoList'] = list(itertools.chain.from_iterable(transaction_lists))
     
     return merged_data
+
+def merge_json_responses_with_temp_files(json_outputs_or_files, csv_filepath, is_files=False):
+    """
+    Merges multiple JSON responses using temp files to reduce memory usage.
+    Writes directly to the final CSV file to minimize memory footprint.
+    
+    Args:
+        json_outputs_or_files: List of JSON strings or file paths
+        csv_filepath: Path to the final CSV output file
+        is_files: If True, treats input as file paths; if False, as JSON strings
+        
+    Returns:
+        dict: Processing statistics including success status, total transactions, and last ID
+    """
+    if not json_outputs_or_files:
+        return {'success': False, 'error': 'No input data provided'}
+    
+    print(f"Processing {len(json_outputs_or_files)} responses with memory-optimized approach...")
+    
+    final_header = None
+    final_csv = None
+    writer = None
+    
+    total_transactions = 0
+    last_transaction_id = None
+    id_field = None
+    success_status = None
+    response_code = None
+    response_message = None
+    
+    try:
+        # Open the final CSV file for writing
+        final_csv = open(csv_filepath, 'w', newline='', encoding='utf-8')
+        
+        for idx, json_data in enumerate(json_outputs_or_files):
+            try:
+                # Load the JSON data - either from string or from file
+                if is_files:
+                    with open(json_data, 'r', encoding='utf-8') as f:
+                        parsed = json.load(f)
+                else:
+                    parsed = json.loads(json_data)
+                
+                # Extract status information from the first response
+                if idx == 0:
+                    success_status = parsed.get('success')
+                    response_code = parsed.get('responseCode')
+                    response_message = parsed.get('responseMessage')
+                
+                # Extract the transaction list
+                records = parsed.get('transactionInfoList', [])
+                if not records:
+                    print(f"Chunk {idx+1}: No transactions found")
+                    continue
+                    
+                # Get the header from the first chunk with data
+                if final_header is None and records:
+                    final_header = list(records[0].keys())
+                    writer = csv.DictWriter(final_csv, fieldnames=final_header)
+                    writer.writeheader()
+                
+                # Find ID field if not already found
+                if not id_field and records:
+                    id_field = next((field for field in ['Id', 'id', 'transactionId', 'transactionID', 'transaction_id'] 
+                                   if field in records[-1]), None)
+                
+                # Write records directly to the final CSV
+                chunk_count = 0
+                for item in records:
+                    if final_header:  # Only write if we have a header
+                        row = {h: (item.get(h, '') if h in item else '') for h in final_header}
+                        writer.writerow(row)
+                        chunk_count += 1
+                        total_transactions += 1
+                
+                # Update last transaction ID
+                if id_field and records:
+                    last_transaction_id = records[-1].get(id_field)
+                
+                # Free up memory immediately
+                del records
+                del parsed
+                
+                print(f"Processed chunk {idx+1}: Added {chunk_count} transactions")
+                
+            except json.JSONDecodeError as e:
+                print(f"Error parsing JSON chunk {idx+1}: {e}")
+                continue
+            except Exception as e:
+                print(f"Error processing chunk {idx+1}: {e}")
+                continue
+                
+        # Print status information
+        if success_status is not None:
+            print(f"Success: {success_status}")
+        if response_code is not None or response_message is not None:
+            print(f"Status: Code='{response_code}', Message='{response_message}'")
+        
+        # Return processing statistics
+        result = {
+            'success': True,
+            'total_transactions': total_transactions,
+            'last_transaction_id': last_transaction_id,
+            'csv_path': csv_filepath
+        }
+        
+        if total_transactions > 0:
+            print(f"Successfully converted JSON data to {csv_filepath}")
+            print(f"Retrieved {total_transactions} transactions")
+            if last_transaction_id:
+                print(f"Last transaction ID: {last_transaction_id}")
+                print(f"To paginate and get the next batch, use: --LastId {last_transaction_id}")
+        else:
+            print("No transactions were processed")
+            result['success'] = False
+            result['error'] = 'No transactions found in any response'
+        
+        return result
+        
+    except Exception as e:
+        print(f"Error during memory-optimized processing: {e}")
+        return {'success': False, 'error': str(e)}
+        
+    finally:
+        # Close the CSV file if it was opened
+        if final_csv:
+            final_csv.close()
 
 def parse_json_to_csv(json_output, csv_filename):
     """Parses a JSON response and writes transaction data to a CSV file."""
@@ -489,7 +744,9 @@ def parse_json_to_csv(json_output, csv_filename):
 
 def main():
     parser = argparse.ArgumentParser(description="Call Bank Mellat Transaction API and convert output to CSV.",
-                                     epilog="For large datasets: Use --AutoPaginate to automatically fetch all transactions across multiple API calls. Use --ChunkSize to specify the maximum number of days per API request (default: 7).")
+                                     epilog="For large datasets: Use --AutoPaginate to automatically fetch all transactions across multiple API calls.\n"
+                                           "Memory management: Memory-optimized processing is used by default. Use --Fast for maximum speed if you have sufficient RAM.\n"
+                                           "Error handling options: --MaxRetries controls retries for transient errors, --MaxConsecutiveFailures sets the limit for pagination failures.")
     parser.add_argument(
         "-U", "--Username",
         default="RSarmaye1402",
@@ -526,6 +783,9 @@ def main():
     parser.add_argument("--RestUrl", default="https://bos.behpardakht.com/bhrws/transactionInfo/getTransactionByDate", help="REST endpoint URL (default: https://bos.behpardakht.com/bhrws/transactionInfo/getTransactionByDate)")
     parser.add_argument("--ChunkSize", type=int, default=7, help="Maximum number of days per API request chunk (default: 7)")
     parser.add_argument("--Delay", type=float, default=3, help="Delay in seconds between API requests to avoid rate limiting (default: 3)")
+    parser.add_argument("--MaxRetries", type=int, default=3, help="Maximum number of retries for failed API requests (default: 3)")
+    parser.add_argument("--MaxConsecutiveFailures", type=int, default=3, help="Maximum number of consecutive failures before giving up on pagination (default: 3)")
+    parser.add_argument("--Fast", action="store_true", help="Use high-memory processing for maximum speed (loads all data into RAM simultaneously)")
 
     args = parser.parse_args()
 
@@ -605,6 +865,10 @@ def main():
             has_more_data = True
             
             # Loop for auto-pagination within this date chunk
+            consecutive_failures = 0
+            max_consecutive_failures = args.MaxConsecutiveFailures  # Use the command-line parameter
+            last_successful_id = current_last_id  # Keep track of the last successful ID
+            
             while has_more_data:
                 page_count += 1
                 
@@ -636,12 +900,24 @@ def main():
                     chunk_from,
                     chunk_to,
                     current_last_id,  # Pass the current LastId parameter for pagination
-                    max_retries=3,
+                    max_retries=args.MaxRetries,
                     initial_delay=3,
-                    backoff_factor=2
+                    backoff_factor=2,
+                    error_type="API request failed"
                 )
                 
-                if json_response and "HTTP_STATUS:429" not in json_response:
+                # Check if the response is a permanent error (starts with ERROR:)
+                if isinstance(json_response, str) and json_response.startswith("ERROR:"):
+                    print(f"Permanent error received: {json_response}")
+                    # For permanent errors, we should stop trying
+                    has_more_data = False
+                    break
+                
+                # Check if we got a valid response
+                if json_response and not json_response.startswith("ERROR:"):
+                    # Reset consecutive failures counter on success
+                    consecutive_failures = 0
+                    
                     # Remove any HTTP status information we added for retry detection
                     if "\nHTTP_STATUS:" in json_response:
                         json_response = json_response.split("\nHTTP_STATUS:")[0]
@@ -678,6 +954,7 @@ def main():
                                     if last_id:
                                         print(f"Retrieved 10,000 transactions. Using field '{id_field}' with last ID: {last_id}")
                                         current_last_id = last_id
+                                        last_successful_id = last_id  # Update the last successful ID
                                     else:
                                         print(f"Field '{id_field}' exists but value is empty. Ending pagination.")
                                         has_more_data = False
@@ -686,7 +963,12 @@ def main():
                                     has_more_data = False
                         except Exception as e:
                             print(f"Error extracting last ID: {e}")
-                            has_more_data = False
+                            # Don't stop pagination on JSON parsing error if we have a valid response
+                            # Just use the previous last_id
+                            if current_last_id:
+                                print(f"Continuing with previous ID: {current_last_id}")
+                            else:
+                                has_more_data = False
                     else:
                         # If not auto-paginating, we're done after one request
                         has_more_data = False
@@ -698,8 +980,24 @@ def main():
                     if not args.AutoPaginate:
                         break
                 else:
-                    print(f"Failed to get a valid response from the REST API")
-                    has_more_data = False
+                    # Transient error or no response
+                    consecutive_failures += 1
+                    print(f"Request failed (attempt {consecutive_failures}/{max_consecutive_failures})")
+                    
+                    if consecutive_failures >= max_consecutive_failures:
+                        print(f"Reached maximum consecutive failures ({max_consecutive_failures}). Stopping pagination for this chunk.")
+                        
+                        # If we had at least one successful response before, we can continue from the last successful ID
+                        if last_successful_id and last_successful_id != args.LastId:
+                            print(f"Will use last successful ID ({last_successful_id}) for the next chunk if available.")
+                            current_last_id = last_successful_id
+                        
+                        has_more_data = False
+                    else:
+                        # For transient errors, add a longer delay before retrying
+                        retry_delay = delay_between_requests * (consecutive_failures + 1) * random.uniform(1.0, 1.5)
+                        print(f"Transient error occurred. Will retry in {retry_delay:.1f} seconds...")
+                        time.sleep(retry_delay)
             
             # Add all responses from this chunk to our overall collection
             if chunk_json_responses:
@@ -709,19 +1007,25 @@ def main():
                 
         # Process all responses from all chunks into a single output file
         if all_json_responses:
-            # If we have multiple responses, merge them
-            if len(all_json_responses) > 1:
-                print(f"Merging {len(all_json_responses)} responses into a single output file...")
-                merged_data = merge_json_responses(all_json_responses)
-                if merged_data:
-                    # Convert merged data back to JSON string
-                    merged_json = json.dumps(merged_data)
-                    parse_json_to_csv(merged_json, csv_filepath)
+            if args.Fast:
+                # Use high-memory approach (traditional approach - keep all in memory)
+                if len(all_json_responses) > 1:
+                    print(f"Merging {len(all_json_responses)} responses into a single output file...")
+                    merged_data = merge_json_responses(all_json_responses)
+                    if merged_data:
+                        # Convert merged data back to JSON string
+                        merged_json = json.dumps(merged_data)
+                        parse_json_to_csv(merged_json, csv_filepath)
+                    else:
+                        print("Failed to merge JSON responses.")
                 else:
-                    print("Failed to merge JSON responses.")
+                    # Just one response, process it directly
+                    parse_json_to_csv(all_json_responses[0], csv_filepath)
             else:
-                # Just one response, process it directly
-                parse_json_to_csv(all_json_responses[0], csv_filepath)
+                # Use memory-optimized approach (default)
+                result = merge_json_responses_with_temp_files(all_json_responses, csv_filepath)
+                if not result.get('success'):
+                    print(f"Failed to process responses with memory-optimized approach: {result.get('error', 'Unknown error')}")
         else:
             print("Failed to get any valid responses from the REST API.")
 
