@@ -334,7 +334,7 @@ def parse_json_to_csv(json_output, csv_filename):
                 header = list(records[0].keys())
                 
                 # Find the last transaction ID for pagination
-                id_field = next((field for field in ['id', 'transactionId', 'transactionID', 'transaction_id'] 
+                id_field = next((field for field in ['Id', 'id', 'transactionId', 'transactionID', 'transaction_id'] 
                                if field in records[-1]), None)
                 if id_field:
                     last_transaction_id = records[-1].get(id_field)
@@ -525,7 +525,7 @@ def main():
     parser.add_argument("--ApiType", choices=["soap", "rest"], default="rest", help="Choose API type: soap or rest (default: rest)")
     parser.add_argument("--RestUrl", default="https://bos.behpardakht.com/bhrws/transactionInfo/getTransactionByDate", help="REST endpoint URL (default: https://bos.behpardakht.com/bhrws/transactionInfo/getTransactionByDate)")
     parser.add_argument("--ChunkSize", type=int, default=7, help="Maximum number of days per API request chunk (default: 7)")
-    parser.add_argument("--Delay", type=float, default=1.5, help="Delay in seconds between API requests to avoid rate limiting (default: 1.5)")
+    parser.add_argument("--Delay", type=float, default=3, help="Delay in seconds between API requests to avoid rate limiting (default: 3)")
 
     args = parser.parse_args()
 
@@ -589,6 +589,9 @@ def main():
         
         # Use the delay specified in command line arguments
         delay_between_requests = args.Delay
+        
+        # Collect all responses from all chunks
+        all_json_responses = []
         
         # Handle each date chunk
         for chunk_idx, (chunk_from, chunk_to) in enumerate(date_chunks):
@@ -657,16 +660,26 @@ def main():
                                 print(f"Retrieved {len(records)} transactions (less than 10,000). End of data reached.")
                                 has_more_data = False
                             else:
+                                # Print available fields in the last record for debugging
+                                print(f"Available fields in response: {list(records[-1].keys())}")
+                                
                                 # Find the last transaction ID for pagination
-                                id_field = next((field for field in ['id', 'transactionId', 'transactionID', 'transaction_id'] 
+                                # Try common ID field names first
+                                id_field = next((field for field in ['Id', 'id', 'transactionId', 'transactionID', 'transaction_id', 'TransactionId'] 
                                                if field in records[-1]), None)
+                                
+                                # If not found, look for any field containing 'id' or 'ID' in its name
+                                if not id_field:
+                                    id_field = next((field for field in records[-1].keys() 
+                                                   if 'id' in field.lower()), None)
+                                
                                 if id_field:
                                     last_id = records[-1].get(id_field)
                                     if last_id:
-                                        print(f"Retrieved 10,000 transactions. Last ID: {last_id}")
+                                        print(f"Retrieved 10,000 transactions. Using field '{id_field}' with last ID: {last_id}")
                                         current_last_id = last_id
                                     else:
-                                        print("Could not extract last ID. Ending pagination.")
+                                        print(f"Field '{id_field}' exists but value is empty. Ending pagination.")
                                         has_more_data = False
                                 else:
                                     print("No ID field found in response. Ending pagination.")
@@ -688,29 +701,29 @@ def main():
                     print(f"Failed to get a valid response from the REST API")
                     has_more_data = False
             
-            # Process all responses for this date chunk
+            # Add all responses from this chunk to our overall collection
             if chunk_json_responses:
-                # Generate a filename for this chunk's output
-                if chunk_idx > 0 or len(date_chunks) > 1:
-                    chunk_csv_filepath = f"{os.path.splitext(csv_filepath)[0]}-chunk{chunk_idx+1}.csv"
-                else:
-                    chunk_csv_filepath = csv_filepath
-                
-                # If we have multiple pages, merge them
-                if len(chunk_json_responses) > 1:
-                    print(f"Merging {len(chunk_json_responses)} pages of responses...")
-                    merged_data = merge_json_responses(chunk_json_responses)
-                    if merged_data:
-                        # Convert merged data back to JSON string
-                        merged_json = json.dumps(merged_data)
-                        parse_json_to_csv(merged_json, chunk_csv_filepath)
-                    else:
-                        print("Failed to merge JSON responses.")
-                else:
-                    # Just one response, process it directly
-                    parse_json_to_csv(chunk_json_responses[0], chunk_csv_filepath)
+                all_json_responses.extend(chunk_json_responses)
             else:
                 print("Failed to get any valid responses from the REST API for this date chunk.")
+                
+        # Process all responses from all chunks into a single output file
+        if all_json_responses:
+            # If we have multiple responses, merge them
+            if len(all_json_responses) > 1:
+                print(f"Merging {len(all_json_responses)} responses into a single output file...")
+                merged_data = merge_json_responses(all_json_responses)
+                if merged_data:
+                    # Convert merged data back to JSON string
+                    merged_json = json.dumps(merged_data)
+                    parse_json_to_csv(merged_json, csv_filepath)
+                else:
+                    print("Failed to merge JSON responses.")
+            else:
+                # Just one response, process it directly
+                parse_json_to_csv(all_json_responses[0], csv_filepath)
+        else:
+            print("Failed to get any valid responses from the REST API.")
 
 if __name__ == "__main__":
     main()
