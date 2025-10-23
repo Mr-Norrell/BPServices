@@ -96,7 +96,7 @@ def call_curl(soap_request_data):
         print("Error: curl command not found. Please ensure curl is installed and in your PATH.")
         return None
 
-def call_rest_curl(url, username, password, terminal_id, from_date, to_date, extra_headers=None):
+def call_rest_curl(url, username, password, terminal_id, from_date, to_date, last_id=None, extra_headers=None):
     """Calls the REST endpoint via curl and returns the output (JSON string)."""
     if not url:
         print("Error: REST URL is required when using REST ApiType.")
@@ -116,6 +116,11 @@ def call_rest_curl(url, username, password, terminal_id, from_date, to_date, ext
         "fromDate": from_date,
         "toDate": to_date
     }
+    
+    # Add id parameter for pagination if provided
+    if last_id:
+        body["id"] = last_id
+        print(f"Using pagination: Requesting transactions after ID {last_id}")
 
     curl_command = [
         'curl',
@@ -313,6 +318,7 @@ def parse_json_to_csv(json_output, csv_filename):
 
     try:
         parsed = json.loads(json_output)
+        last_transaction_id = None
 
         if isinstance(parsed, dict):
             success = parsed.get('success')
@@ -326,6 +332,16 @@ def parse_json_to_csv(json_output, csv_filename):
             records = parsed.get('transactionInfoList')
             if isinstance(records, list) and records:
                 header = list(records[0].keys())
+                
+                # Find the last transaction ID for pagination
+                id_field = next((field for field in ['id', 'transactionId', 'transactionID', 'transaction_id'] 
+                               if field in records[-1]), None)
+                if id_field:
+                    last_transaction_id = records[-1].get(id_field)
+                    if last_transaction_id:
+                        print(f"Last transaction ID: {last_transaction_id}")
+                        print(f"To paginate and get the next batch, use: --LastId {last_transaction_id}")
+                
                 with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
                     writer = csv.DictWriter(csvfile, fieldnames=header)
                     writer.writeheader()
@@ -333,6 +349,13 @@ def parse_json_to_csv(json_output, csv_filename):
                         row = {h: (item.get(h, '') if isinstance(item, dict) else '') for h in header}
                         writer.writerow(row)
                 print(f"Successfully converted JSON data to {csv_filename}")
+                
+                # Report transaction count
+                print(f"Retrieved {len(records)} transactions")
+                if len(records) == 10000:
+                    print("Note: You received exactly 10,000 transactions, which is the API limit.")
+                    print("There may be more transactions available. Use the Last ID to paginate.")
+                
                 return True
 
             # Fallback: write the dict as a single row
@@ -465,7 +488,8 @@ def parse_json_to_csv(json_output, csv_filename):
         return False
 
 def main():
-    parser = argparse.ArgumentParser(description="Call Bank Mellat Transaction API and convert output to CSV.")
+    parser = argparse.ArgumentParser(description="Call Bank Mellat Transaction API and convert output to CSV.",
+                                     epilog="For large datasets: Use --AutoPaginate to automatically fetch all transactions across multiple API calls. Use --ChunkSize to specify the maximum number of days per API request (default: 7).")
     parser.add_argument(
         "-U", "--Username",
         default="RSarmaye1402",
@@ -476,6 +500,21 @@ def main():
         default="12021453",
         help="Password for authentication (default: 18316913)"
     )
+    parser.add_argument(
+        "-I", "--LastId",
+        help="Last transaction ID for pagination (get transactions after this ID)"
+    )
+    parser.add_argument(
+        "--AutoPaginate", 
+        action="store_true",
+        help="Automatically paginate through all results using the lastId"
+    )
+    parser.add_argument(
+        "--MaxPages", 
+        type=int, 
+        default=10,
+        help="Maximum number of pages to fetch when using AutoPaginate (default: 10)"
+    )
     parser.add_argument("-T", "--TerminalId", required=True, help="Terminal ID")
     parser.add_argument(
         "-F", "--FromDate",
@@ -485,6 +524,7 @@ def main():
     parser.add_argument("-O", "--ToDate", required=True, help="To Date in YYYYMMDD format")
     parser.add_argument("--ApiType", choices=["soap", "rest"], default="rest", help="Choose API type: soap or rest (default: rest)")
     parser.add_argument("--RestUrl", default="https://bos.behpardakht.com/bhrws/transactionInfo/getTransactionByDate", help="REST endpoint URL (default: https://bos.behpardakht.com/bhrws/transactionInfo/getTransactionByDate)")
+    parser.add_argument("--ChunkSize", type=int, default=7, help="Maximum number of days per API request chunk (default: 7)")
     parser.add_argument("--Delay", type=float, default=1.5, help="Delay in seconds between API requests to avoid rate limiting (default: 1.5)")
 
     args = parser.parse_args()
@@ -508,7 +548,11 @@ def main():
         return
 
 
-    csv_filename = f"{args.TerminalId}-{args.FromDate}-{args.ToDate}.csv"
+    # Include LastId in filename if provided for pagination
+    if args.LastId:
+        csv_filename = f"{args.TerminalId}-{args.FromDate}-{args.ToDate}-after-{args.LastId}.csv"
+    else:
+        csv_filename = f"{args.TerminalId}-{args.FromDate}-{args.ToDate}.csv"
     script_dir = os.path.dirname(os.path.abspath(__file__))
     csv_filepath = os.path.join(script_dir, csv_filename)
 
@@ -531,71 +575,142 @@ def main():
         else:
             print("Failed to get a response from the SOAP API.")
     else:
-        # For REST API, check if we need to split the date range (max 7 days)
-        date_chunks = split_date_range(args.FromDate, args.ToDate, max_days=7)
+        # For REST API, check if we need to split the date range according to the chunk size
+        date_chunks = split_date_range(args.FromDate, args.ToDate, max_days=args.ChunkSize)
         
         if not date_chunks:
             print("Failed to process date range. Please check your date format.")
             return
             
         if len(date_chunks) > 1:
-            print(f"Date range exceeds 7 days. Breaking into {len(date_chunks)} chunks:")
+            print(f"Date range exceeds {args.ChunkSize} days. Breaking into {len(date_chunks)} chunks:")
             for i, (chunk_from, chunk_to) in enumerate(date_chunks):
                 print(f"  Chunk {i+1}: {chunk_from} to {chunk_to}")
-                
-        # Collect responses from all chunks
-        json_responses = []
         
         # Use the delay specified in command line arguments
         delay_between_requests = args.Delay
         
-        for i, (chunk_from, chunk_to) in enumerate(date_chunks):
-            # Add delay between requests to avoid rate limiting, except for the first request
-            if i > 0:
-                delay_with_jitter = delay_between_requests * random.uniform(0.9, 1.1)
-                print(f"Waiting {delay_with_jitter:.1f} seconds before next request...")
-                time.sleep(delay_with_jitter)
+        # Handle each date chunk
+        for chunk_idx, (chunk_from, chunk_to) in enumerate(date_chunks):
+            if chunk_idx > 0:
+                print(f"\n--- Processing date chunk {chunk_idx+1}/{len(date_chunks)} ---")
             
-            print(f"Requesting data for period: {chunk_from} to {chunk_to}")
+            # For auto-pagination, we'll collect all responses for this date chunk
+            chunk_json_responses = []
+            current_last_id = args.LastId  # Start with user-provided LastId if any
+            page_count = 0
+            has_more_data = True
             
-            # Use retry mechanism for the API call
-            json_response = retry_with_backoff(
-                call_rest_curl,
-                args.RestUrl,
-                args.Username,
-                args.Password,
-                args.TerminalId,
-                chunk_from,
-                chunk_to,
-                max_retries=3,
-                initial_delay=3,
-                backoff_factor=2
-            )
-            
-            if json_response and "HTTP_STATUS:429" not in json_response:
-                # Remove any HTTP status information we added for retry detection
-                if "\nHTTP_STATUS:" in json_response:
-                    json_response = json_response.split("\nHTTP_STATUS:")[0]
-                json_responses.append(json_response)
-            else:
-                print(f"Failed to get a valid response from the REST API for period {chunk_from} to {chunk_to}")
-        
-        if json_responses:
-            # If we have multiple responses, merge them
-            if len(json_responses) > 1:
-                print(f"Merging {len(json_responses)} responses...")
-                merged_data = merge_json_responses(json_responses)
-                if merged_data:
-                    # Convert merged data back to JSON string
-                    merged_json = json.dumps(merged_data)
-                    parse_json_to_csv(merged_json, csv_filepath)
+            # Loop for auto-pagination within this date chunk
+            while has_more_data:
+                page_count += 1
+                
+                # Break if we've reached the maximum number of pages
+                if args.AutoPaginate and page_count > args.MaxPages:
+                    print(f"Reached maximum number of pages ({args.MaxPages}). Stopping pagination.")
+                    break
+                
+                # Add delay between requests to avoid rate limiting, except for the first request
+                if page_count > 1 or chunk_idx > 0:
+                    delay_with_jitter = delay_between_requests * random.uniform(0.9, 1.1)
+                    print(f"Waiting {delay_with_jitter:.1f} seconds before next request...")
+                    time.sleep(delay_with_jitter)
+                
+                if args.AutoPaginate and page_count > 1:
+                    print(f"Auto-paginating: Requesting page {page_count} (transactions after ID: {current_last_id})")
+                elif current_last_id:
+                    print(f"Requesting data for period {chunk_from} to {chunk_to} (after ID: {current_last_id})")
                 else:
-                    print("Failed to merge JSON responses.")
+                    print(f"Requesting data for period: {chunk_from} to {chunk_to}")
+                
+                # Use retry mechanism for the API call
+                json_response = retry_with_backoff(
+                    call_rest_curl,
+                    args.RestUrl,
+                    args.Username,
+                    args.Password,
+                    args.TerminalId,
+                    chunk_from,
+                    chunk_to,
+                    current_last_id,  # Pass the current LastId parameter for pagination
+                    max_retries=3,
+                    initial_delay=3,
+                    backoff_factor=2
+                )
+                
+                if json_response and "HTTP_STATUS:429" not in json_response:
+                    # Remove any HTTP status information we added for retry detection
+                    if "\nHTTP_STATUS:" in json_response:
+                        json_response = json_response.split("\nHTTP_STATUS:")[0]
+                    
+                    # Extract the last transaction ID for auto-pagination
+                    last_id = None
+                    if args.AutoPaginate:
+                        try:
+                            parsed = json.loads(json_response)
+                            records = parsed.get('transactionInfoList', [])
+                            
+                            if not records:
+                                print("No transactions in response. Ending pagination.")
+                                has_more_data = False
+                            elif len(records) < 10000:
+                                print(f"Retrieved {len(records)} transactions (less than 10,000). End of data reached.")
+                                has_more_data = False
+                            else:
+                                # Find the last transaction ID for pagination
+                                id_field = next((field for field in ['id', 'transactionId', 'transactionID', 'transaction_id'] 
+                                               if field in records[-1]), None)
+                                if id_field:
+                                    last_id = records[-1].get(id_field)
+                                    if last_id:
+                                        print(f"Retrieved 10,000 transactions. Last ID: {last_id}")
+                                        current_last_id = last_id
+                                    else:
+                                        print("Could not extract last ID. Ending pagination.")
+                                        has_more_data = False
+                                else:
+                                    print("No ID field found in response. Ending pagination.")
+                                    has_more_data = False
+                        except Exception as e:
+                            print(f"Error extracting last ID: {e}")
+                            has_more_data = False
+                    else:
+                        # If not auto-paginating, we're done after one request
+                        has_more_data = False
+                    
+                    # Add this response to our collection
+                    chunk_json_responses.append(json_response)
+                    
+                    # If not auto-paginating or we couldn't extract a last ID, we're done
+                    if not args.AutoPaginate:
+                        break
+                else:
+                    print(f"Failed to get a valid response from the REST API")
+                    has_more_data = False
+            
+            # Process all responses for this date chunk
+            if chunk_json_responses:
+                # Generate a filename for this chunk's output
+                if chunk_idx > 0 or len(date_chunks) > 1:
+                    chunk_csv_filepath = f"{os.path.splitext(csv_filepath)[0]}-chunk{chunk_idx+1}.csv"
+                else:
+                    chunk_csv_filepath = csv_filepath
+                
+                # If we have multiple pages, merge them
+                if len(chunk_json_responses) > 1:
+                    print(f"Merging {len(chunk_json_responses)} pages of responses...")
+                    merged_data = merge_json_responses(chunk_json_responses)
+                    if merged_data:
+                        # Convert merged data back to JSON string
+                        merged_json = json.dumps(merged_data)
+                        parse_json_to_csv(merged_json, chunk_csv_filepath)
+                    else:
+                        print("Failed to merge JSON responses.")
+                else:
+                    # Just one response, process it directly
+                    parse_json_to_csv(chunk_json_responses[0], chunk_csv_filepath)
             else:
-                # Just one response, process it directly
-                parse_json_to_csv(json_responses[0], csv_filepath)
-        else:
-            print("Failed to get any valid responses from the REST API.")
+                print("Failed to get any valid responses from the REST API for this date chunk.")
 
 if __name__ == "__main__":
     main()
