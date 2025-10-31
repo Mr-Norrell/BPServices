@@ -98,7 +98,7 @@ def call_curl(soap_request_data):
         print("Error: curl command not found. Please ensure curl is installed and in your PATH.")
         return None
 
-def call_rest_curl(url, username, password, terminal_id, from_date, to_date, last_id=None, extra_headers=None):
+def call_rest_curl(url, username, password, terminal_id, from_date, to_date, last_id=None, extra_headers=None, connect_timeout=15, request_timeout=60):
     """
     Calls the REST endpoint via curl and returns the output (JSON string).
     
@@ -136,8 +136,8 @@ def call_rest_curl(url, username, password, terminal_id, from_date, to_date, las
         '--silent',            # do not print progress meter
         '--show-error',        # still show errors
         '--location',          # follow redirects
-        '--connect-timeout', '30',  # timeout for connection phase
-        '--max-time', '120',        # max time for the whole operation
+        '--connect-timeout', str(connect_timeout),  # configurable connection timeout
+        '--max-time', str(request_timeout),         # configurable request timeout
         '-X', 'POST', url,
         '-H', f"Content-Type: {headers['Content-Type']}",
         '-H', f"Accept: {headers['Accept']}",
@@ -148,7 +148,9 @@ def call_rest_curl(url, username, password, terminal_id, from_date, to_date, las
 
     print("Executing REST curl command...")
     try:
-        process = subprocess.run(curl_command, capture_output=True, text=True, check=False, encoding='utf-8')
+        # Add Python-level timeout as a safety net (10 seconds longer than curl's max-time)
+        python_timeout = request_timeout + 10
+        process = subprocess.run(curl_command, capture_output=True, text=True, check=False, encoding='utf-8', timeout=python_timeout)
         stdout_text = process.stdout or ""
         stderr_text = process.stderr or ""
 
@@ -263,18 +265,25 @@ def call_rest_curl(url, username, password, terminal_id, from_date, to_date, las
             print("Warning: Empty response body.")
             return None
             
-        # Try to parse as JSON to validate the response
+        # Try to parse as JSON to validate the response (excluding the HTTP status we appended)
+        json_to_validate = stdout_text
+        if "\nHTTP_STATUS:" in json_to_validate:
+            json_to_validate = json_to_validate.split("\nHTTP_STATUS:")[0]
+            
         try:
-            json.loads(stdout_text)
+            json.loads(json_to_validate)
         except json.JSONDecodeError:
             print("Warning: Response is not valid JSON. This might indicate a partial or corrupted response.")
             # If response is not valid JSON, treat as transient error
-            if len(stdout_text) < 100:  # If it's a short response, print it for debugging
-                print(f"Invalid JSON response: {stdout_text}")
+            if len(json_to_validate) < 500:  # If it's a short response, print it for debugging
+                print(f"Invalid JSON response: {json_to_validate}")
             return None
 
         return stdout_text
         
+    except subprocess.TimeoutExpired:
+        print(f"Request timed out after {python_timeout} seconds (Python timeout)")
+        return None  # Treat timeout as transient error
     except FileNotFoundError:
         print("Error: curl command not found. Please ensure curl is installed and in your PATH.")
         return "ERROR: curl command not found"
@@ -746,7 +755,8 @@ def main():
     parser = argparse.ArgumentParser(description="Call Bank Mellat Transaction API and convert output to CSV.",
                                      epilog="For large datasets: Use --AutoPaginate to automatically fetch all transactions across multiple API calls.\n"
                                            "Memory management: Memory-optimized processing is used by default. Use --Fast for maximum speed if you have sufficient RAM.\n"
-                                           "Error handling options: --MaxRetries controls retries for transient errors, --MaxConsecutiveFailures sets the limit for pagination failures.")
+                                           "Error handling options: --MaxRetries controls retries for transient errors, --MaxConsecutiveFailures sets the limit for pagination failures.\n"
+                                           "Timeout options: --ConnectTimeout and --RequestTimeout control how long to wait for API responses.")
     parser.add_argument(
         "-U", "--Username",
         default="RSarmaye1402",
@@ -785,6 +795,8 @@ def main():
     parser.add_argument("--Delay", type=float, default=3, help="Delay in seconds between API requests to avoid rate limiting (default: 3)")
     parser.add_argument("--MaxRetries", type=int, default=3, help="Maximum number of retries for failed API requests (default: 3)")
     parser.add_argument("--MaxConsecutiveFailures", type=int, default=3, help="Maximum number of consecutive failures before giving up on pagination (default: 3)")
+    parser.add_argument("--ConnectTimeout", type=int, default=15, help="Connection timeout in seconds for curl requests (default: 15)")
+    parser.add_argument("--RequestTimeout", type=int, default=60, help="Maximum time in seconds for each API request (default: 60)")
     parser.add_argument("--Fast", action="store_true", help="Use high-memory processing for maximum speed (loads all data into RAM simultaneously)")
 
     args = parser.parse_args()
@@ -900,6 +912,9 @@ def main():
                     chunk_from,
                     chunk_to,
                     current_last_id,  # Pass the current LastId parameter for pagination
+                    None,  # extra_headers
+                    args.ConnectTimeout,  # connect_timeout
+                    args.RequestTimeout,  # request_timeout
                     max_retries=args.MaxRetries,
                     initial_delay=3,
                     backoff_factor=2,
