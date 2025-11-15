@@ -780,7 +780,7 @@ def main():
         "--MaxPages", 
         type=int, 
         default=10,
-        help="Maximum number of pages to fetch when using AutoPaginate (default: 10)"
+        help="Maximum number of pages to fetch when using AutoPaginate (default: 10, use 0 for unlimited)"
     )
     parser.add_argument("-T", "--TerminalId", required=True, help="Terminal ID")
     parser.add_argument(
@@ -884,8 +884,8 @@ def main():
             while has_more_data:
                 page_count += 1
                 
-                # Break if we've reached the maximum number of pages
-                if args.AutoPaginate and page_count > args.MaxPages:
+                # Break if we've reached the maximum number of pages (0 means unlimited)
+                if args.AutoPaginate and args.MaxPages > 0 and page_count > args.MaxPages:
                     print(f"Reached maximum number of pages ({args.MaxPages}). Stopping pagination.")
                     break
                 

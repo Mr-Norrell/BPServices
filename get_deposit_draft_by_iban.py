@@ -7,6 +7,45 @@ import csv
 import os
 import time
 import random
+from datetime import datetime, timedelta
+
+
+def parse_date(date_str):
+    """Parse a date string in YYYYMMDD format to a datetime object."""
+    try:
+        return datetime.strptime(date_str, '%Y%m%d')
+    except ValueError as e:
+        print(f"Error parsing date {date_str}: {e}")
+        return None
+
+
+def format_date(date_obj):
+    """Format a datetime object to YYYYMMDD string."""
+    return date_obj.strftime('%Y%m%d')
+
+
+def split_date_range(from_date_str, to_date_str):
+    """Split a date range into daily chunks since the API only accepts single days."""
+    from_date = parse_date(from_date_str)
+    to_date = parse_date(to_date_str)
+    
+    if not from_date or not to_date:
+        return []
+    
+    if from_date > to_date:
+        print(f"Error: FromDate {from_date_str} is after ToDate {to_date_str}")
+        return []
+    
+    # Generate daily chunks
+    chunks = []
+    current_date = from_date
+    
+    while current_date <= to_date:
+        date_str = format_date(current_date)
+        chunks.append(date_str)
+        current_date += timedelta(days=1)
+    
+    return chunks
 
 
 def call_get_deposit_draft_by_iban(
@@ -355,7 +394,8 @@ def main():
         epilog=(
             "Authentication: Uses HTTP Basic Auth (Authorization header).\n"
             "Pagination: Use --AutoPaginate to follow 'id' and fetch subsequent pages.\n"
-            "Dates: draftDate must be Jalali (YYYYMMDD), as per documentation."
+            "Dates: Use --DraftDate for single day or --FromDate/--ToDate for date ranges. All dates must be Jalali (YYYYMMDD).\n"
+            "Date ranges: API only accepts single days, so date ranges are split into daily requests automatically."
         ),
     )
 
@@ -363,14 +403,24 @@ def main():
     parser.add_argument("--Password", "-P", default="12021453", help="Password for Basic Auth")
     parser.add_argument("--Iban", required=True, help="Destination IBAN (e.g., IR..)")
     parser.add_argument(
+        "--FromDate",
+        "-F",
+        help="From Date in Jalali YYYYMMDD format (defaults to ToDate if not provided)",
+    )
+    parser.add_argument(
+        "--ToDate",
+        "-O",
+        required=True,
+        help="To Date in Jalali YYYYMMDD format",
+    )
+    parser.add_argument(
         "--DraftDate",
         "-D",
-        required=True,
-        help="Draft date in Jalali YYYYMMDD (e.g., 14010914)",
+        help="Single draft date in Jalali YYYYMMDD (e.g., 14010914) - alternative to FromDate/ToDate range",
     )
     parser.add_argument("--LastId", "-I", help="Last id for pagination (fetch items after this id)")
     parser.add_argument("--AutoPaginate", action="store_true", help="Automatically paginate through all results using id")
-    parser.add_argument("--MaxPages", type=int, default=10, help="Maximum pages to fetch when using AutoPaginate (default: 10)")
+    parser.add_argument("--MaxPages", type=int, default=10, help="Maximum pages to fetch when using AutoPaginate (default: 10, use 0 for unlimited)")
     parser.add_argument(
         "--RestUrl",
         default="https://bos.bpm.bankmellat.ir/bhrws/transactionInfo/getDepositDraftByIban",
@@ -383,107 +433,181 @@ def main():
 
     args = parser.parse_args()
 
+    # Handle date arguments - support both single DraftDate and FromDate/ToDate range
+    if args.DraftDate:
+        # Single date mode
+        from_date = args.DraftDate
+        to_date = args.DraftDate
+        print(f"Using single draft date: {args.DraftDate}")
+    else:
+        # Date range mode
+        if not args.ToDate:
+            print("Error: Either --DraftDate or --ToDate must be provided.")
+            return
+        
+        # Set FromDate to ToDate if FromDate is not provided
+        if args.FromDate is None:
+            args.FromDate = args.ToDate
+            print(f"FromDate not provided, defaulting to ToDate: {args.FromDate}")
+        
+        from_date = args.FromDate
+        to_date = args.ToDate
+
+    # Date format validation
+    if not (len(to_date) == 8 and to_date.isdigit()):
+        print("Error: ToDate must be in YYYYMMDD format.")
+        return
+    if not (len(from_date) == 8 and from_date.isdigit()):
+        print("Error: FromDate must be in YYYYMMDD format.")
+        return
+
     # Prepare output filename
     iban_safe = sanitize_iban_for_filename(args.Iban)
     if args.LastId:
-        csv_filename = f"{iban_safe}-{args.DraftDate}-after-{args.LastId}.csv"
+        csv_filename = f"{iban_safe}-{from_date}-{to_date}-after-{args.LastId}.csv"
     else:
-        csv_filename = f"{iban_safe}-{args.DraftDate}.csv"
+        csv_filename = f"{iban_safe}-{from_date}-{to_date}.csv"
     script_dir = os.path.dirname(os.path.abspath(__file__))
     csv_filepath = os.path.join(script_dir, csv_filename)
 
-    # Collect responses (may be multiple pages)
+    # Split date range into daily chunks since API only accepts single days
+    date_chunks = split_date_range(from_date, to_date)
+    
+    if not date_chunks:
+        print("Failed to process date range. Please check your date format.")
+        return
+        
+    if len(date_chunks) > 1:
+        print(f"Date range spans {len(date_chunks)} days. Processing each day separately:")
+        for i, date_str in enumerate(date_chunks):
+            print(f"  Day {i+1}: {date_str}")
+    
+    # Use the delay specified in command line arguments
+    delay_between_requests = args.Delay
+    
+    # Collect all responses from all date chunks
     all_json_responses = []
+    
+    # Handle each date chunk
+    for chunk_idx, current_draft_date in enumerate(date_chunks):
+        if chunk_idx > 0:
+            print(f"\n--- Processing date {chunk_idx+1}/{len(date_chunks)}: {current_draft_date} ---")
+        
+        # For auto-pagination, we'll collect all responses for this date
+        chunk_json_responses = []
+        current_last_id = args.LastId  # Start with user-provided LastId if any
+        page_count = 0
+        has_more_data = True
+        
+        # Loop for auto-pagination within this date
+        consecutive_failures = 0
+        max_consecutive_failures = 3
+        last_successful_id = current_last_id  # Keep track of the last successful ID
+        
+        while has_more_data:
+            page_count += 1
 
-    # Single call (or first page)
-    current_last_id = args.LastId
-    page_count = 0
-    has_more_data = True
-    consecutive_failures = 0
-    max_consecutive_failures = 3
-
-    while has_more_data:
-        page_count += 1
-
-        if args.AutoPaginate and page_count > args.MaxPages:
-            print(f"Reached maximum number of pages ({args.MaxPages}). Stopping pagination.")
-            break
-
-        if page_count > 1:
-            delay_with_jitter = args.Delay * random.uniform(0.9, 1.1)
-            print(f"Waiting {delay_with_jitter:.1f} seconds before next request...")
-            time.sleep(delay_with_jitter)
-
-        if args.AutoPaginate and page_count > 1:
-            print(f"Auto-paginating: Requesting page {page_count} (after id: {current_last_id})")
-        elif current_last_id:
-            print(f"Requesting data (after id: {current_last_id})")
-        else:
-            print("Requesting data")
-
-        json_response = retry_with_backoff(
-            call_get_deposit_draft_by_iban,
-            args.RestUrl,
-            args.Username,
-            args.Password,
-            args.DraftDate,
-            args.Iban,
-            current_last_id,
-            None,
-            args.ConnectTimeout,
-            args.RequestTimeout,
-            max_retries=args.MaxRetries,
-            initial_delay=3,
-            backoff_factor=2,
-            error_type="API request failed",
-        )
-
-        if isinstance(json_response, str) and json_response.startswith("ERROR:"):
-            print(f"Permanent error received: {json_response}")
-            break
-
-        if json_response and not json_response.startswith("ERROR:"):
-            # Strip HTTP_STATUS meta
-            if "\nHTTP_STATUS:" in json_response:
-                json_response = json_response.split("\nHTTP_STATUS:")[0]
-
-            all_json_responses.append(json_response)
-
-            # Determine whether to continue
-            if not args.AutoPaginate:
+            # Check page limit (0 means unlimited)
+            if args.AutoPaginate and args.MaxPages > 0 and page_count > args.MaxPages:
+                print(f"Reached maximum number of pages ({args.MaxPages}). Stopping pagination.")
                 break
 
-            try:
-                parsed = json.loads(json_response)
-                records = parsed.get("depositInfoList", [])
-                if not records:
-                    print("No records in response. Ending pagination.")
+            # Add delay between requests to avoid rate limiting, except for the first request
+            if page_count > 1 or chunk_idx > 0:
+                delay_with_jitter = delay_between_requests * random.uniform(0.9, 1.1)
+                print(f"Waiting {delay_with_jitter:.1f} seconds before next request...")
+                time.sleep(delay_with_jitter)
+
+            if args.AutoPaginate and page_count > 1:
+                print(f"Auto-paginating: Requesting page {page_count} for date {current_draft_date} (after id: {current_last_id})")
+            elif current_last_id:
+                print(f"Requesting data for date {current_draft_date} (after id: {current_last_id})")
+            else:
+                print(f"Requesting data for date: {current_draft_date}")
+
+            json_response = retry_with_backoff(
+                call_get_deposit_draft_by_iban,
+                args.RestUrl,
+                args.Username,
+                args.Password,
+                current_draft_date,  # Use the current date from the chunk
+                args.Iban,
+                current_last_id,
+                None,
+                args.ConnectTimeout,
+                args.RequestTimeout,
+                max_retries=args.MaxRetries,
+                initial_delay=3,
+                backoff_factor=2,
+                error_type="API request failed",
+            )
+
+            # Check if the response is a permanent error (starts with ERROR:)
+            if isinstance(json_response, str) and json_response.startswith("ERROR:"):
+                print(f"Permanent error received: {json_response}")
+                # For permanent errors, we should stop trying
+                has_more_data = False
+                break
+
+            # Check if we got a valid response
+            if json_response and not json_response.startswith("ERROR:"):
+                # Reset consecutive failures counter on success
+                consecutive_failures = 0
+                
+                # Strip HTTP_STATUS meta
+                if "\nHTTP_STATUS:" in json_response:
+                    json_response = json_response.split("\nHTTP_STATUS:")[0]
+
+                chunk_json_responses.append(json_response)
+
+                # Determine whether to continue
+                if not args.AutoPaginate:
                     has_more_data = False
                 else:
-                    # find last id
-                    last_item = records[-1]
-                    next_id = last_item.get("id")
-                    print(f"Retrieved {len(records)} records; last id: {next_id}")
-                    if next_id and len(records) >= 1000:
-                        current_last_id = next_id
-                        has_more_data = True
-                    else:
+                    try:
+                        parsed = json.loads(json_response)
+                        records = parsed.get("depositInfoList", [])
+                        if not records:
+                            print("No records in response. Ending pagination.")
+                            has_more_data = False
+                        else:
+                            # find last id
+                            last_item = records[-1]
+                            next_id = last_item.get("id")
+                            print(f"Retrieved {len(records)} records; last id: {next_id}")
+                            if next_id and len(records) >= 1000:
+                                current_last_id = next_id
+                                last_successful_id = next_id  # Update the last successful ID
+                                has_more_data = True
+                            else:
+                                has_more_data = False
+                    except Exception as e:
+                        print(f"Error inspecting response for pagination: {e}")
                         has_more_data = False
-            except Exception as e:
-                print(f"Error inspecting response for pagination: {e}")
-                has_more_data = False
-
-            consecutive_failures = 0
+            else:
+                # transient error or no response
+                consecutive_failures += 1
+                print(f"Request failed (attempt {consecutive_failures}/{max_consecutive_failures})")
+                if consecutive_failures >= max_consecutive_failures:
+                    print(f"Reached maximum consecutive failures ({max_consecutive_failures}). Stopping pagination for this date.")
+                    
+                    # If we had at least one successful response before, we can continue from the last successful ID
+                    if last_successful_id and last_successful_id != args.LastId:
+                        print(f"Will use last successful ID ({last_successful_id}) for the next date if available.")
+                        current_last_id = last_successful_id
+                    
+                    has_more_data = False
+                else:
+                    # For transient errors, add a longer delay before retrying
+                    retry_delay = delay_between_requests * (consecutive_failures + 1) * random.uniform(1.0, 1.5)
+                    print(f"Transient error occurred. Will retry in {retry_delay:.1f} seconds...")
+                    time.sleep(retry_delay)
+        
+        # Add all responses from this date to our overall collection
+        if chunk_json_responses:
+            all_json_responses.extend(chunk_json_responses)
         else:
-            # transient error or no response
-            consecutive_failures += 1
-            print(f"Request failed (attempt {consecutive_failures}/{max_consecutive_failures})")
-            if consecutive_failures >= max_consecutive_failures:
-                print("Reached maximum consecutive failures. Stopping.")
-                break
-            retry_delay = args.Delay * (consecutive_failures + 1) * random.uniform(1.0, 1.5)
-            print(f"Transient error occurred. Will retry in {retry_delay:.1f} seconds...")
-            time.sleep(retry_delay)
+            print("Failed to get any valid responses from the REST API for this date.")
 
     # Write the last page or merge? For simplicity, write only the last complete page if multiple.
     # Here we merge pages by concatenating their arrays before writing.
