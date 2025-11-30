@@ -7,8 +7,46 @@ import csv
 import os
 import time
 import random
+import signal
+import atexit
 from datetime import datetime, timedelta
 
+# Global variables for graceful shutdown
+current_csv_file = None
+current_csv_writer = None
+total_records_processed = 0
+last_processed_id = None
+shutdown_requested = False
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully."""
+    global shutdown_requested, current_csv_file, total_records_processed, last_processed_id
+    
+    signal_names = {signal.SIGINT: "SIGINT (Ctrl+C)", signal.SIGTERM: "SIGTERM"}
+    signal_name = signal_names.get(signum, f"Signal {signum}")
+    
+    print(f"\n🛑 Received {signal_name}. Gracefully shutting down...")
+    shutdown_requested = True
+    
+    if current_csv_file:
+        print(f"💾 Finalizing output file: {current_csv_file}")
+        print(f"📊 Total deposit records processed so far: {total_records_processed}")
+        if last_processed_id:
+            print(f"🔗 Last processed record ID: {last_processed_id}")
+            print(f"📝 To continue from where you left off, use: --LastId {last_processed_id}")
+    
+    # Don't exit immediately - let the main loop handle cleanup
+    return
+
+def cleanup_on_exit():
+    """Cleanup function called on normal exit."""
+    global current_csv_file, current_csv_writer
+    if current_csv_writer:
+        try:
+            # Ensure any buffered data is written
+            current_csv_writer = None
+        except:
+            pass
 
 def parse_date(date_str):
     """Parse a date string in YYYYMMDD format to a datetime object."""
@@ -377,6 +415,84 @@ def parse_deposit_json_to_csv(json_output, csv_filename):
         return False
 
 
+def write_deposit_chunk_to_csv_incremental(json_response, csv_filepath, is_first_chunk=False):
+    """
+    Writes a single JSON response chunk to CSV file incrementally for deposit data.
+    
+    Args:
+        json_response: JSON string response from getDepositDraftByIban API
+        csv_filepath: Path to the CSV output file
+        is_first_chunk: If True, creates new file with header; if False, appends to existing file
+        
+    Returns:
+        dict: Processing statistics including success status, record count, and last ID
+    """
+    global current_csv_file, current_csv_writer, total_records_processed, last_processed_id
+    
+    if not json_response:
+        return {'success': False, 'error': 'No JSON response provided', 'record_count': 0}
+    
+    try:
+        # Remove HTTP status information if present
+        json_to_parse = json_response
+        if "\nHTTP_STATUS:" in json_to_parse:
+            json_to_parse = json_to_parse.split("\nHTTP_STATUS:")[0]
+            
+        parsed = json.loads(json_to_parse)
+        
+        # Extract deposit record list
+        records = parsed.get('depositInfoList', [])
+        if not records:
+            print("  No deposit records in this chunk")
+            return {'success': True, 'record_count': 0, 'last_id': last_processed_id}
+        
+        # Get header from first record
+        header = list(records[0].keys())
+        
+        # Find ID field for tracking
+        id_field = next((field for field in ['id', 'Id', 'depositId', 'depositID', 'deposit_id'] 
+                       if field in records[-1]), None)
+        
+        # Open CSV file (create new or append)
+        mode = 'w' if is_first_chunk else 'a'
+        with open(csv_filepath, mode, newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=header)
+            
+            # Write header only for the first chunk
+            if is_first_chunk:
+                writer.writeheader()
+                current_csv_file = csv_filepath
+                print(f"📁 Created output file: {csv_filepath}")
+            
+            # Write all records from this chunk
+            chunk_count = 0
+            for item in records:
+                row = {h: (item.get(h, '') if h in item else '') for h in header}
+                writer.writerow(row)
+                chunk_count += 1
+                total_records_processed += 1
+            
+            # Update last processed ID
+            if id_field and records:
+                last_processed_id = records[-1].get(id_field)
+        
+        print(f"  ✅ Wrote {chunk_count} deposit records to CSV (Total: {total_records_processed})")
+        
+        return {
+            'success': True,
+            'record_count': chunk_count,
+            'last_id': last_processed_id,
+            'total_processed': total_records_processed
+        }
+        
+    except json.JSONDecodeError as e:
+        print(f"  ❌ Error parsing JSON chunk: {e}")
+        return {'success': False, 'error': f'JSON parse error: {e}', 'record_count': 0}
+    except Exception as e:
+        print(f"  ❌ Error writing chunk to CSV: {e}")
+        return {'success': False, 'error': str(e), 'record_count': 0}
+
+
 def sanitize_iban_for_filename(iban):
     # Keep alphanumerics, replace others with '_'
     safe = []
@@ -389,6 +505,13 @@ def sanitize_iban_for_filename(iban):
 
 
 def main():
+    global shutdown_requested, current_csv_file, total_records_processed, last_processed_id
+    
+    # Set up signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
+    signal.signal(signal.SIGTERM, signal_handler)  # kill command
+    atexit.register(cleanup_on_exit)
+    
     parser = argparse.ArgumentParser(
         description="Call getDepositDraftByIban REST API and convert output to CSV.",
         epilog=(
@@ -485,16 +608,23 @@ def main():
     # Use the delay specified in command line arguments
     delay_between_requests = args.Delay
     
-    # Collect all responses from all date chunks
-    all_json_responses = []
+    # Track processing state for incremental output
+    is_first_chunk_written = False
+    total_chunks_processed = 0
+    
+    print(f"🚀 Starting incremental processing of {len(date_chunks)} date(s)")
+    print(f"📄 Output will be written incrementally to: {csv_filepath}")
     
     # Handle each date chunk
     for chunk_idx, current_draft_date in enumerate(date_chunks):
+        # Check for shutdown signal before processing each date
+        if shutdown_requested:
+            print(f"\n🛑 Shutdown requested. Stopping at date {chunk_idx+1}/{len(date_chunks)}")
+            break
+            
         if chunk_idx > 0:
             print(f"\n--- Processing date {chunk_idx+1}/{len(date_chunks)}: {current_draft_date} ---")
         
-        # For auto-pagination, we'll collect all responses for this date
-        chunk_json_responses = []
         current_last_id = args.LastId  # Start with user-provided LastId if any
         page_count = 0
         has_more_data = True
@@ -504,7 +634,7 @@ def main():
         max_consecutive_failures = 3
         last_successful_id = current_last_id  # Keep track of the last successful ID
         
-        while has_more_data:
+        while has_more_data and not shutdown_requested:
             page_count += 1
 
             # Check page limit (0 means unlimited)
@@ -554,36 +684,50 @@ def main():
                 # Reset consecutive failures counter on success
                 consecutive_failures = 0
                 
-                # Strip HTTP_STATUS meta
-                if "\nHTTP_STATUS:" in json_response:
-                    json_response = json_response.split("\nHTTP_STATUS:")[0]
-
-                chunk_json_responses.append(json_response)
-
-                # Determine whether to continue
-                if not args.AutoPaginate:
-                    has_more_data = False
-                else:
-                    try:
-                        parsed = json.loads(json_response)
-                        records = parsed.get("depositInfoList", [])
-                        if not records:
-                            print("No records in response. Ending pagination.")
-                            has_more_data = False
-                        else:
-                            # find last id
-                            last_item = records[-1]
-                            next_id = last_item.get("id")
-                            print(f"Retrieved {len(records)} records; last id: {next_id}")
-                            if next_id and len(records) >= 1000:
-                                current_last_id = next_id
-                                last_successful_id = next_id  # Update the last successful ID
-                                has_more_data = True
-                            else:
-                                has_more_data = False
-                    except Exception as e:
-                        print(f"Error inspecting response for pagination: {e}")
+                # Write this chunk immediately to CSV
+                write_result = write_deposit_chunk_to_csv_incremental(
+                    json_response, 
+                    csv_filepath, 
+                    is_first_chunk=(not is_first_chunk_written)
+                )
+                
+                if write_result['success']:
+                    if not is_first_chunk_written:
+                        is_first_chunk_written = True
+                    
+                    # Determine whether to continue with pagination
+                    if not args.AutoPaginate:
                         has_more_data = False
+                    else:
+                        try:
+                            # Remove HTTP status info for parsing
+                            json_to_parse = json_response
+                            if "\nHTTP_STATUS:" in json_to_parse:
+                                json_to_parse = json_to_parse.split("\nHTTP_STATUS:")[0]
+                                
+                            parsed = json.loads(json_to_parse)
+                            records = parsed.get("depositInfoList", [])
+                            if not records:
+                                print("  No records in response. Ending pagination.")
+                                has_more_data = False
+                            else:
+                                # Find last id for pagination
+                                last_item = records[-1]
+                                next_id = last_item.get("id")
+                                print(f"  Retrieved {len(records)} records; last id: {next_id}")
+                                if next_id and len(records) >= 1000:
+                                    current_last_id = next_id
+                                    last_successful_id = next_id
+                                    has_more_data = True
+                                else:
+                                    print(f"  Retrieved {len(records)} records (less than 1000). End of data reached.")
+                                    has_more_data = False
+                        except Exception as e:
+                            print(f"  Error inspecting response for pagination: {e}")
+                            has_more_data = False
+                else:
+                    print(f"  ❌ Failed to write chunk: {write_result.get('error', 'Unknown error')}")
+                    # Continue with next request even if this chunk failed to write
             else:
                 # transient error or no response
                 consecutive_failures += 1
@@ -603,39 +747,29 @@ def main():
                     print(f"Transient error occurred. Will retry in {retry_delay:.1f} seconds...")
                     time.sleep(retry_delay)
         
-        # Add all responses from this date to our overall collection
-        if chunk_json_responses:
-            all_json_responses.extend(chunk_json_responses)
-        else:
-            print("Failed to get any valid responses from the REST API for this date.")
-
-    # Write the last page or merge? For simplicity, write only the last complete page if multiple.
-    # Here we merge pages by concatenating their arrays before writing.
-    if not all_json_responses:
-        print("Failed to get any valid responses from the REST API.")
-        return
-
-    try:
-        merged = None
-        for idx, js in enumerate(all_json_responses):
-            data = json.loads(js)
-            if merged is None:
-                merged = data
-                # Normalize to ensure list exists
-                if isinstance(merged, dict) and "depositInfoList" in merged and not isinstance(merged["depositInfoList"], list):
-                    merged["depositInfoList"] = [merged["depositInfoList"]]
-            else:
-                if isinstance(data, dict):
-                    lst = data.get("depositInfoList", [])
-                    if isinstance(lst, list):
-                        merged.setdefault("depositInfoList", [])
-                        merged["depositInfoList"].extend(lst)
-        if merged is None:
-            print("Nothing to write to CSV.")
-            return
-        parse_deposit_json_to_csv(json.dumps(merged), csv_filepath)
-    except Exception as e:
-        print(f"Failed to merge/write responses: {e}")
+        total_chunks_processed += 1
+        
+        # Check for shutdown signal after each date
+        if shutdown_requested:
+            print(f"\n🛑 Shutdown requested after processing date {chunk_idx+1}/{len(date_chunks)}")
+            break
+            
+    # Final summary
+    print(f"\n📊 Processing Summary:")
+    print(f"   Processed {total_chunks_processed}/{len(date_chunks)} dates")
+    print(f"   Total deposit records written: {total_records_processed}")
+    if last_processed_id:
+        print(f"   Last processed record ID: {last_processed_id}")
+        print(f"   To continue from where you left off, use: --LastId {last_processed_id}")
+    
+    if is_first_chunk_written:
+        print(f"✅ Output file completed: {csv_filepath}")
+    else:
+        print("❌ No data was written to output file.")
+        
+    if shutdown_requested:
+        print("⚠️  Processing was interrupted but output file contains all data processed so far.")
+        return  # Exit gracefully without error
 
 
 if __name__ == "__main__":

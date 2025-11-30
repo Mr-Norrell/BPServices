@@ -3,3 +3,4 @@ BPM-getOnlineTransactionByDate-DEV-MNU.pdf
 BPM-getTransactionByDate-DEV-MNU.pdf
 __pycache__/get_transactions.cpython-311.pyc
 BPM-getDepositDraftByIban-DEV-MNU.txt
+__pycache__/get_deposit_draft_by_iban.cpython-311.pyc

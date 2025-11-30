@@ -15,7 +15,46 @@ import time
 import random
 import tempfile
 import shutil
+import signal
+import atexit
 # import shlex # For debugging curl command construction
+
+# Global variables for graceful shutdown
+current_csv_file = None
+current_csv_writer = None
+total_transactions_processed = 0
+last_processed_id = None
+shutdown_requested = False
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully."""
+    global shutdown_requested, current_csv_file, total_transactions_processed, last_processed_id
+    
+    signal_names = {signal.SIGINT: "SIGINT (Ctrl+C)", signal.SIGTERM: "SIGTERM"}
+    signal_name = signal_names.get(signum, f"Signal {signum}")
+    
+    print(f"\n🛑 Received {signal_name}. Gracefully shutting down...")
+    shutdown_requested = True
+    
+    if current_csv_file:
+        print(f"💾 Finalizing output file: {current_csv_file}")
+        print(f"📊 Total transactions processed so far: {total_transactions_processed}")
+        if last_processed_id:
+            print(f"🔗 Last processed transaction ID: {last_processed_id}")
+            print(f"📝 To continue from where you left off, use: --LastId {last_processed_id}")
+    
+    # Don't exit immediately - let the main loop handle cleanup
+    return
+
+def cleanup_on_exit():
+    """Cleanup function called on normal exit."""
+    global current_csv_file, current_csv_writer
+    if current_csv_writer:
+        try:
+            # Ensure any buffered data is written
+            current_csv_writer = None
+        except:
+            pass
 
 def generate_soap_headers_values():
     """Generates dynamic values for SOAP headers."""
@@ -574,6 +613,83 @@ def merge_json_responses_with_temp_files(json_outputs_or_files, csv_filepath, is
         if final_csv:
             final_csv.close()
 
+def write_chunk_to_csv_incremental(json_response, csv_filepath, is_first_chunk=False):
+    """
+    Writes a single JSON response chunk to CSV file incrementally.
+    
+    Args:
+        json_response: JSON string response from API
+        csv_filepath: Path to the CSV output file
+        is_first_chunk: If True, creates new file with header; if False, appends to existing file
+        
+    Returns:
+        dict: Processing statistics including success status, transaction count, and last ID
+    """
+    global current_csv_file, current_csv_writer, total_transactions_processed, last_processed_id
+    
+    if not json_response:
+        return {'success': False, 'error': 'No JSON response provided', 'transaction_count': 0}
+    
+    try:
+        # Remove HTTP status information if present
+        json_to_parse = json_response
+        if "\nHTTP_STATUS:" in json_to_parse:
+            json_to_parse = json_to_parse.split("\nHTTP_STATUS:")[0]
+            
+        parsed = json.loads(json_to_parse)
+        
+        # Extract transaction list
+        records = parsed.get('transactionInfoList', [])
+        if not records:
+            print("  No transactions in this chunk")
+            return {'success': True, 'transaction_count': 0, 'last_id': last_processed_id}
+        
+        # Get header from first record
+        header = list(records[0].keys())
+        
+        # Find ID field for tracking
+        id_field = next((field for field in ['Id', 'id', 'transactionId', 'transactionID', 'transaction_id'] 
+                       if field in records[-1]), None)
+        
+        # Open CSV file (create new or append)
+        mode = 'w' if is_first_chunk else 'a'
+        with open(csv_filepath, mode, newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=header)
+            
+            # Write header only for the first chunk
+            if is_first_chunk:
+                writer.writeheader()
+                current_csv_file = csv_filepath
+                print(f"📁 Created output file: {csv_filepath}")
+            
+            # Write all records from this chunk
+            chunk_count = 0
+            for item in records:
+                row = {h: (item.get(h, '') if h in item else '') for h in header}
+                writer.writerow(row)
+                chunk_count += 1
+                total_transactions_processed += 1
+            
+            # Update last processed ID
+            if id_field and records:
+                last_processed_id = records[-1].get(id_field)
+        
+        print(f"  ✅ Wrote {chunk_count} transactions to CSV (Total: {total_transactions_processed})")
+        
+        return {
+            'success': True,
+            'transaction_count': chunk_count,
+            'last_id': last_processed_id,
+            'total_processed': total_transactions_processed
+        }
+        
+    except json.JSONDecodeError as e:
+        print(f"  ❌ Error parsing JSON chunk: {e}")
+        return {'success': False, 'error': f'JSON parse error: {e}', 'transaction_count': 0}
+    except Exception as e:
+        print(f"  ❌ Error writing chunk to CSV: {e}")
+        return {'success': False, 'error': str(e), 'transaction_count': 0}
+
 def parse_json_to_csv(json_output, csv_filename):
     """Parses a JSON response and writes transaction data to a CSV file."""
     if not json_output:
@@ -752,6 +868,13 @@ def parse_json_to_csv(json_output, csv_filename):
         return False
 
 def main():
+    global shutdown_requested, current_csv_file, total_transactions_processed, last_processed_id
+    
+    # Set up signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
+    signal.signal(signal.SIGTERM, signal_handler)  # kill command
+    atexit.register(cleanup_on_exit)
+    
     parser = argparse.ArgumentParser(description="Call Bank Mellat Transaction API and convert output to CSV.",
                                      epilog="For large datasets: Use --AutoPaginate to automatically fetch all transactions across multiple API calls.\n"
                                            "Memory management: Memory-optimized processing is used by default. Use --Fast for maximum speed if you have sufficient RAM.\n"
@@ -862,16 +985,23 @@ def main():
         # Use the delay specified in command line arguments
         delay_between_requests = args.Delay
         
-        # Collect all responses from all chunks
-        all_json_responses = []
+        # Track processing state for incremental output
+        is_first_chunk_written = False
+        total_chunks_processed = 0
+        
+        print(f"🚀 Starting incremental processing of {len(date_chunks)} date chunk(s)")
+        print(f"📄 Output will be written incrementally to: {csv_filepath}")
         
         # Handle each date chunk
         for chunk_idx, (chunk_from, chunk_to) in enumerate(date_chunks):
+            # Check for shutdown signal before processing each chunk
+            if shutdown_requested:
+                print(f"\n🛑 Shutdown requested. Stopping at chunk {chunk_idx+1}/{len(date_chunks)}")
+                break
+                
             if chunk_idx > 0:
                 print(f"\n--- Processing date chunk {chunk_idx+1}/{len(date_chunks)} ---")
             
-            # For auto-pagination, we'll collect all responses for this date chunk
-            chunk_json_responses = []
             current_last_id = args.LastId  # Start with user-provided LastId if any
             page_count = 0
             has_more_data = True
@@ -881,7 +1011,7 @@ def main():
             max_consecutive_failures = args.MaxConsecutiveFailures  # Use the command-line parameter
             last_successful_id = current_last_id  # Keep track of the last successful ID
             
-            while has_more_data:
+            while has_more_data and not shutdown_requested:
                 page_count += 1
                 
                 # Break if we've reached the maximum number of pages (0 means unlimited)
@@ -933,63 +1063,67 @@ def main():
                     # Reset consecutive failures counter on success
                     consecutive_failures = 0
                     
-                    # Remove any HTTP status information we added for retry detection
-                    if "\nHTTP_STATUS:" in json_response:
-                        json_response = json_response.split("\nHTTP_STATUS:")[0]
+                    # Write this chunk immediately to CSV
+                    write_result = write_chunk_to_csv_incremental(
+                        json_response, 
+                        csv_filepath, 
+                        is_first_chunk=(not is_first_chunk_written)
+                    )
                     
-                    # Extract the last transaction ID for auto-pagination
-                    last_id = None
-                    if args.AutoPaginate:
-                        try:
-                            parsed = json.loads(json_response)
-                            records = parsed.get('transactionInfoList', [])
-                            
-                            if not records:
-                                print("No transactions in response. Ending pagination.")
-                                has_more_data = False
-                            elif len(records) < 10000:
-                                print(f"Retrieved {len(records)} transactions (less than 10,000). End of data reached.")
-                                has_more_data = False
-                            else:
-                                # Print available fields in the last record for debugging
-                                print(f"Available fields in response: {list(records[-1].keys())}")
+                    if write_result['success']:
+                        if not is_first_chunk_written:
+                            is_first_chunk_written = True
+                        
+                        # Extract the last transaction ID for auto-pagination
+                        if args.AutoPaginate:
+                            try:
+                                # Remove HTTP status info for parsing
+                                json_to_parse = json_response
+                                if "\nHTTP_STATUS:" in json_to_parse:
+                                    json_to_parse = json_to_parse.split("\nHTTP_STATUS:")[0]
+                                    
+                                parsed = json.loads(json_to_parse)
+                                records = parsed.get('transactionInfoList', [])
                                 
-                                # Find the last transaction ID for pagination
-                                # Try common ID field names first
-                                id_field = next((field for field in ['Id', 'id', 'transactionId', 'transactionID', 'transaction_id', 'TransactionId'] 
-                                               if field in records[-1]), None)
-                                
-                                # If not found, look for any field containing 'id' or 'ID' in its name
-                                if not id_field:
-                                    id_field = next((field for field in records[-1].keys() 
-                                                   if 'id' in field.lower()), None)
-                                
-                                if id_field:
-                                    last_id = records[-1].get(id_field)
-                                    if last_id:
-                                        print(f"Retrieved 10,000 transactions. Using field '{id_field}' with last ID: {last_id}")
-                                        current_last_id = last_id
-                                        last_successful_id = last_id  # Update the last successful ID
-                                    else:
-                                        print(f"Field '{id_field}' exists but value is empty. Ending pagination.")
-                                        has_more_data = False
-                                else:
-                                    print("No ID field found in response. Ending pagination.")
+                                if not records:
+                                    print("  No transactions in response. Ending pagination.")
                                     has_more_data = False
-                        except Exception as e:
-                            print(f"Error extracting last ID: {e}")
-                            # Don't stop pagination on JSON parsing error if we have a valid response
-                            # Just use the previous last_id
-                            if current_last_id:
-                                print(f"Continuing with previous ID: {current_last_id}")
-                            else:
-                                has_more_data = False
+                                elif len(records) < 10000:
+                                    print(f"  Retrieved {len(records)} transactions (less than 10,000). End of data reached.")
+                                    has_more_data = False
+                                else:
+                                    # Find the last transaction ID for pagination
+                                    id_field = next((field for field in ['Id', 'id', 'transactionId', 'transactionID', 'transaction_id', 'TransactionId'] 
+                                                   if field in records[-1]), None)
+                                    
+                                    if not id_field:
+                                        id_field = next((field for field in records[-1].keys() 
+                                                       if 'id' in field.lower()), None)
+                                    
+                                    if id_field:
+                                        last_id = records[-1].get(id_field)
+                                        if last_id:
+                                            print(f"  Retrieved 10,000 transactions. Using field '{id_field}' with last ID: {last_id}")
+                                            current_last_id = last_id
+                                            last_successful_id = last_id
+                                        else:
+                                            print(f"  Field '{id_field}' exists but value is empty. Ending pagination.")
+                                            has_more_data = False
+                                    else:
+                                        print("  No ID field found in response. Ending pagination.")
+                                        has_more_data = False
+                            except Exception as e:
+                                print(f"  Error extracting last ID: {e}")
+                                if current_last_id:
+                                    print(f"  Continuing with previous ID: {current_last_id}")
+                                else:
+                                    has_more_data = False
+                        else:
+                            # If not auto-paginating, we're done after one request
+                            has_more_data = False
                     else:
-                        # If not auto-paginating, we're done after one request
-                        has_more_data = False
-                    
-                    # Add this response to our collection
-                    chunk_json_responses.append(json_response)
+                        print(f"  ❌ Failed to write chunk: {write_result.get('error', 'Unknown error')}")
+                        # Continue with next request even if this chunk failed to write
                     
                     # If not auto-paginating or we couldn't extract a last ID, we're done
                     if not args.AutoPaginate:
@@ -1014,35 +1148,29 @@ def main():
                         print(f"Transient error occurred. Will retry in {retry_delay:.1f} seconds...")
                         time.sleep(retry_delay)
             
-            # Add all responses from this chunk to our overall collection
-            if chunk_json_responses:
-                all_json_responses.extend(chunk_json_responses)
-            else:
-                print("Failed to get any valid responses from the REST API for this date chunk.")
+            total_chunks_processed += 1
+            
+            # Check for shutdown signal after each chunk
+            if shutdown_requested:
+                print(f"\n🛑 Shutdown requested after processing chunk {chunk_idx+1}/{len(date_chunks)}")
+                break
                 
-        # Process all responses from all chunks into a single output file
-        if all_json_responses:
-            if args.Fast:
-                # Use high-memory approach (traditional approach - keep all in memory)
-                if len(all_json_responses) > 1:
-                    print(f"Merging {len(all_json_responses)} responses into a single output file...")
-                    merged_data = merge_json_responses(all_json_responses)
-                    if merged_data:
-                        # Convert merged data back to JSON string
-                        merged_json = json.dumps(merged_data)
-                        parse_json_to_csv(merged_json, csv_filepath)
-                    else:
-                        print("Failed to merge JSON responses.")
-                else:
-                    # Just one response, process it directly
-                    parse_json_to_csv(all_json_responses[0], csv_filepath)
-            else:
-                # Use memory-optimized approach (default)
-                result = merge_json_responses_with_temp_files(all_json_responses, csv_filepath)
-                if not result.get('success'):
-                    print(f"Failed to process responses with memory-optimized approach: {result.get('error', 'Unknown error')}")
+        # Final summary
+        print(f"\n📊 Processing Summary:")
+        print(f"   Processed {total_chunks_processed}/{len(date_chunks)} date chunks")
+        print(f"   Total transactions written: {total_transactions_processed}")
+        if last_processed_id:
+            print(f"   Last processed transaction ID: {last_processed_id}")
+            print(f"   To continue from where you left off, use: --LastId {last_processed_id}")
+        
+        if is_first_chunk_written:
+            print(f"✅ Output file completed: {csv_filepath}")
         else:
-            print("Failed to get any valid responses from the REST API.")
+            print("❌ No data was written to output file.")
+            
+        if shutdown_requested:
+            print("⚠️  Processing was interrupted but output file contains all data processed so far.")
+            return  # Exit gracefully without error
 
 if __name__ == "__main__":
     main()
